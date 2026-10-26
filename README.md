@@ -8,7 +8,7 @@ Private by design: nothing is exposed to the public internet. All traffic flows 
 
 ## 1. What You Need
 
-1. **Home Server:** An always-on machine at home (Raspberry Pi 4, mini PC, or old laptop) running Linux (Ubuntu, Debian, or Raspberry Pi OS).
+1. **Home Server:** An always-on machine at home (mini PC, old laptop, or Raspberry Pi) running Linux (Fedora, Ubuntu, Debian, or Raspberry Pi OS).
 2. **Publisher Device (iPad):** An iPad running iOS 16.4+ on a stand with its charger plugged in.
 3. **Viewer Devices:** Your phone (e.g. Google Pixel) or laptop.
 4. **Tailscale Account:** A free [Tailscale](https://tailscale.com) account.
@@ -16,6 +16,19 @@ Private by design: nothing is exposed to the public internet. All traffic flows 
 ---
 
 ## 2. Install the Server
+
+### Step 1: Install Prerequisites
+
+- **On Fedora:**
+  ```bash
+  sudo dnf install -y python3 python3-pip git
+  ```
+- **On Ubuntu / Debian / Raspberry Pi OS:**
+  ```bash
+  sudo apt update && sudo apt install -y python3 python3-pip python3-venv git
+  ```
+
+### Step 2: Clone & Set Up Virtual Environment
 
 Clone the repository on your home server:
 
@@ -96,10 +109,18 @@ WebRTC media capture (`getUserMedia`) requires a secure HTTPS context. Tailscale
    sudo tailscale serve --bg https / http://127.0.0.1:8000
    ```
    *Note:* The Uvicorn server listens on `127.0.0.1:8000` only, never on `0.0.0.0`. `tailscale serve` terminates HTTPS and proxies requests securely.
+   *Fedora Note:* Fedora's `firewalld` requires no open ports because all incoming traffic flows through Tailscale's local proxy.
 4. **Install Tailscale on iPad and Pixel:**
    - Install the official Tailscale app from the App Store / Google Play Store.
    - Sign in with the exact same account.
    - On iOS, toggle the switch to **Connected** and tap **Allow** when prompted to add VPN configurations.
+
+> **Tip for Fedora Laptops:** If using a Fedora laptop with the lid closed as your home server, prevent it from suspending by editing `/etc/systemd/logind.conf`:
+> ```ini
+> HandleLidSwitch=ignore
+> HandleLidSwitchExternalPower=ignore
+> ```
+> Then run `sudo systemctl restart systemd-logind`.
 
 ---
 
