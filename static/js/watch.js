@@ -61,6 +61,19 @@
 
   // 1. Initialization and Auth
   function init() {
+    // Check if key is provided via URL fragment (e.g. from QR code scan: /watch#key=...)
+    if (window.location.hash) {
+      const hash = window.location.hash.substring(1);
+      const params = new URLSearchParams(hash);
+      const urlKey = params.get('key') || (hash.length >= 32 && !hash.includes('=') ? hash : null);
+      if (urlKey && urlKey.length >= 32) {
+        viewerKey = urlKey;
+        localStorage.setItem(STORAGE_KEY, viewerKey);
+        window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
+        log('info', 'Viewer key imported seamlessly from QR code link');
+      }
+    }
+
     if (viewerKey) {
       keyCard?.classList.add('hidden');
     } else {
@@ -72,6 +85,38 @@
     audioToggleBtn?.addEventListener('click', toggleAudio);
     qualityToggleBtn?.addEventListener('click', toggleQuality);
     reconnectBtn?.addEventListener('click', () => manualReconnect('User requested reconnect'));
+
+    // Share QR Modal
+    const shareQrBtn = document.getElementById('share-qr-btn');
+    const qrModal = document.getElementById('qr-modal');
+    const closeQrBtn = document.getElementById('close-qr-btn');
+    const qrDisplay = document.getElementById('qr-code-display');
+    const qrLinkCopy = document.getElementById('qr-link-copy');
+
+    if (shareQrBtn && qrModal) {
+      shareQrBtn.addEventListener('click', () => {
+        if (!viewerKey) {
+          alert('Please enter or connect with your viewer key first.');
+          return;
+        }
+        const pairingUrl = `${window.location.origin}/watch#key=${encodeURIComponent(viewerKey)}`;
+        if (window.Petcam.renderQr && qrDisplay) {
+          window.Petcam.renderQr(qrDisplay, pairingUrl);
+        }
+        if (qrLinkCopy) {
+          qrLinkCopy.textContent = pairingUrl;
+          qrLinkCopy.onclick = () => {
+            navigator.clipboard.writeText(pairingUrl);
+            alert('Pairing link copied to clipboard!');
+          };
+        }
+        qrModal.classList.remove('hidden');
+      });
+
+      closeQrBtn?.addEventListener('click', () => {
+        qrModal.classList.add('hidden');
+      });
+    }
 
     // Video fullscreen on single tap; ignore double-tap
     initFullscreenTap();

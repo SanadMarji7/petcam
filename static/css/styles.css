@@ -479,3 +479,57 @@ html, body {
 .hidden {
   display: none !important;
 }
+
+/* QR Code Modal Box */
+.qr-modal-box {
+  max-width: 420px;
+  height: auto;
+  min-height: 380px;
+}
+
+.qr-modal-body {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 16px;
+  background-color: var(--bg-surface);
+}
+
+.qr-instructions {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.qr-code-display {
+  padding: 12px;
+  background-color: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.qr-code-display svg, .qr-code-display canvas {
+  display: block;
+}
+
+.qr-link-copy {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-brand);
+  cursor: pointer;
+  word-break: break-all;
+  padding: 8px 12px;
+  background-color: rgba(59, 130, 246, 0.1);
+  border-radius: 6px;
+  border: 1px dashed rgba(59, 130, 246, 0.4);
+}
+
+.qr-link-copy:hover {
+  background-color: rgba(59, 130, 246, 0.2);
+}
+

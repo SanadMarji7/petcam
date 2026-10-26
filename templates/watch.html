@@ -19,6 +19,7 @@
           <span class="title">Petcam Live</span>
         </div>
         <div class="header-actions">
+          <button id="share-qr-btn" class="btn btn-secondary btn-sm" title="Show QR code to let another phone watch">Share QR</button>
           <button id="forget-key-btn" class="btn-text btn-sm" title="Clear stored viewer key">Forget Key</button>
         </div>
       </header>
@@ -106,6 +107,21 @@
           <button id="close-log-btn" class="btn btn-sm">Close</button>
         </div>
         <div id="log-entries" class="log-entries"></div>
+      </div>
+    </div>
+
+    <!-- Share QR Code Modal -->
+    <div id="qr-modal" class="log-modal hidden" role="dialog" aria-modal="true" aria-label="Share Stream QR Code">
+      <div class="log-modal-content qr-modal-box">
+        <div class="log-modal-header">
+          <h3>Scan to Watch Live</h3>
+          <button id="close-qr-btn" class="btn btn-sm">Close</button>
+        </div>
+        <div class="qr-modal-body">
+          <p class="qr-instructions">Scan this code with a second phone or tablet camera to start watching instantly:</p>
+          <div id="qr-code-display" class="qr-code-display"></div>
+          <p id="qr-link-copy" class="qr-link-copy" title="Click to copy pairing link"></p>
+        </div>
       </div>
     </div>
 

@@ -32,6 +32,26 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Option A: Automatic Setup Assistant with QR Codes (Recommended)
+
+Run the interactive setup assistant:
+
+```bash
+python3 setup.py
+```
+
+This single command will:
+1. Automatically detect your machine's Tailscale MagicDNS hostname.
+2. Generate cryptographically secure 32-character authentication keys.
+3. Create your `config.toml`.
+4. **Print scannable graphical QR codes right in your terminal**:
+   - 📸 **Scan with iPad:** Instantly pairs and opens `/cam` with zero typing.
+   - 📱 **Scan with Pixel / Phone:** Instantly pairs and opens `/watch`.
+
+---
+
+### Option B: Manual Configuration
+
 Generate two secure random 32-character authentication keys:
 
 ```bash

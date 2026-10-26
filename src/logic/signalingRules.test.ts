@@ -6,6 +6,8 @@ import {
   calculateBackoffDelay,
   evaluateWatchdogAction,
   getBitrateProfile,
+  extractKeyFromFragment,
+  buildPairingUrl,
   MAX_MESSAGE_SIZE_BYTES,
 } from './signalingRules';
 
@@ -71,4 +73,23 @@ test('getBitrateProfile returns exact specifications from spec', () => {
   const highProfile = getBitrateProfile('high');
   assert.equal(highProfile.maxBitrate, 2_000_000);
   assert.equal(highProfile.maxFramerate, 30);
+});
+
+test('extractKeyFromFragment extracts valid keys and ignores short or invalid tokens', () => {
+  const testKey = '12345678901234567890123456789012';
+  assert.equal(extractKeyFromFragment(`#key=${testKey}`), testKey);
+  assert.equal(extractKeyFromFragment(`key=${testKey}`), testKey);
+  assert.equal(extractKeyFromFragment(`#key=${testKey}&autoplay=1`), testKey);
+  assert.equal(extractKeyFromFragment(`#${testKey}`), testKey);
+  assert.equal(extractKeyFromFragment('#key=short_token'), null);
+  assert.equal(extractKeyFromFragment(''), null);
+  assert.equal(extractKeyFromFragment('#'), null);
+});
+
+test('buildPairingUrl formats secure fragment URLs', () => {
+  const url = buildPairingUrl('https://dogcam.example.ts.net', 'watch', 'testkey_0123456789abcdef0123456789');
+  assert.equal(url, 'https://dogcam.example.ts.net/watch#key=testkey_0123456789abcdef0123456789');
+  
+  const camUrl = buildPairingUrl('https://dogcam.example.ts.net/', 'cam', 'testkey_0123456789abcdef0123456789');
+  assert.equal(camUrl, 'https://dogcam.example.ts.net/cam#key=testkey_0123456789abcdef0123456789');
 });

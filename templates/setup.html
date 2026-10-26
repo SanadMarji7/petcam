@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b0f19" />
+    <title>Petcam — Easy Setup & QR Pairing</title>
+    <link rel="stylesheet" href="/static/css/styles.css" />
+    <style>
+      body.role-setup {
+        overflow-y: auto;
+        padding: 24px 16px;
+        display: flex;
+        justify-content: center;
+      }
+      .setup-page-container {
+        width: 100%;
+        max-width: 900px;
+        margin: 0 auto;
+        display: flex;
+        flex-direction: column;
+        gap: 24px;
+      }
+      .setup-header {
+        text-align: center;
+        padding: 24px;
+        background-color: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        border-radius: 16px;
+      }
+      .setup-header h1 {
+        font-size: 24px;
+        font-weight: 700;
+        margin-bottom: 8px;
+      }
+      .setup-header p {
+        font-size: 14px;
+        color: var(--text-muted);
+      }
+      .qr-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 20px;
+      }
+      .qr-card {
+        background-color: var(--bg-card);
+        border: 1px solid var(--border-subtle);
+        border-radius: 16px;
+        padding: 24px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+      }
+      .qr-card-tag {
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        padding: 4px 10px;
+        border-radius: 20px;
+        margin-bottom: 12px;
+      }
+      .tag-publisher {
+        background-color: rgba(59, 130, 246, 0.2);
+        color: #60a5fa;
+        border: 1px solid rgba(59, 130, 246, 0.4);
+      }
+      .tag-viewer {
+        background-color: rgba(16, 185, 129, 0.2);
+        color: #34d399;
+        border: 1px solid rgba(16, 185, 129, 0.4);
+      }
+      .qr-card h2 {
+        font-size: 18px;
+        font-weight: 600;
+        margin-bottom: 8px;
+      }
+      .qr-card p {
+        font-size: 13px;
+        color: var(--text-muted);
+        line-height: 1.4;
+        margin-bottom: 16px;
+      }
+      .qr-box {
+        background-color: #ffffff;
+        padding: 12px;
+        border-radius: 12px;
+        margin-bottom: 16px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      }
+      .pairing-link-box {
+        font-family: var(--font-mono);
+        font-size: 11px;
+        background-color: var(--bg-surface);
+        padding: 8px 12px;
+        border-radius: 8px;
+        border: 1px solid var(--border-subtle);
+        word-break: break-all;
+        cursor: pointer;
+        color: var(--color-brand);
+        margin-bottom: 12px;
+        width: 100%;
+      }
+      .checklist-card {
+        background-color: var(--bg-surface);
+        border: 1px solid var(--border-subtle);
+        border-radius: 16px;
+        padding: 24px;
+      }
+      .checklist-card h3 {
+        font-size: 16px;
+        font-weight: 600;
+        margin-bottom: 12px;
+      }
+      .steps-list {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        font-size: 13px;
+        color: #cbd5e1;
+        line-height: 1.5;
+      }
+      .step-item {
+        display: flex;
+        gap: 10px;
+        align-items: flex-start;
+      }
+      .step-num {
+        background-color: var(--color-brand);
+        color: #fff;
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 11px;
+        font-weight: 700;
+        flex-shrink: 0;
+      }
+    </style>
+  </head>
+  <body class="role-setup">
+    <div class="setup-page-container">
+      <header class="setup-header">
+        <h1>🐶 Petcam Setup & QR Pairing</h1>
+        <p>Zero-typing device setup: point your camera at the QR code below to pair instantly.</p>
+      </header>
+
+      <div class="qr-grid">
+        <!-- iPad Publisher Card -->
+        <div class="qr-card">
+          <span class="qr-card-tag tag-publisher">1. iPad Camera Stream</span>
+          <h2>Scan with iPad</h2>
+          <p>Open the default iPad Camera app, point at this code, and tap the yellow Safari link:</p>
+          <div id="cam-qr" class="qr-box"></div>
+          <div class="pairing-link-box" id="copy-cam-link" title="Click to copy pairing link">
+            {{ cam_url }}
+          </div>
+          <span style="font-size: 11px; color: #94a3b8;">Key auto-saves into iPad localStorage.</span>
+        </div>
+
+        <!-- Pixel Viewer Card -->
+        <div class="qr-card">
+          <span class="qr-card-tag tag-viewer">2. Pixel Live Watch</span>
+          <h2>Scan with Phone</h2>
+          <p>Point your Google Pixel or any phone/laptop camera at this code to watch live:</p>
+          <div id="watch-qr" class="qr-box"></div>
+          <div class="pairing-link-box" id="copy-watch-link" title="Click to copy pairing link">
+            {{ watch_url }}
+          </div>
+          <span style="font-size: 11px; color: #94a3b8;">In Chrome, tap &quot;Add to Home screen&quot; for full-screen.</span>
+        </div>
+      </div>
+
+      <!-- Quick Checklist -->
+      <div class="checklist-card">
+        <h3>iPad Checklist (Keeps Camera Running Unattended):</h3>
+        <div class="steps-list">
+          <div class="step-item">
+            <span class="step-num">1</span>
+            <div><strong>Wall Power & Stand:</strong> Plug the iPad in on a stand aimed at your dog&apos;s spot.</div>
+          </div>
+          <div class="step-item">
+            <span class="step-num">2</span>
+            <div><strong>Auto-Lock to Never:</strong> iOS Settings &rarr; Display &rarr; Auto-Lock &rarr; Never. Turn brightness down.</div>
+          </div>
+          <div class="step-item">
+            <span class="step-num">3</span>
+            <div><strong>Guided Access:</strong> iOS Settings &rarr; Accessibility &rarr; Guided Access &rarr; On. Tap Start Camera, then triple-click side button to lock Safari in place.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="/static/js/common.js"></script>
+    <script>
+      document.addEventListener('DOMContentLoaded', () => {
+        const camUrl = {{ cam_url | tojson }};
+        const watchUrl = {{ watch_url | tojson }};
+
+        const camContainer = document.getElementById('cam-qr');
+        const watchContainer = document.getElementById('watch-qr');
+
+        if (window.Petcam && window.Petcam.renderQr) {
+          window.Petcam.renderQr(camContainer, camUrl);
+          window.Petcam.renderQr(watchContainer, watchUrl);
+        }
+
+        const copyCam = document.getElementById('copy-cam-link');
+        if (copyCam) {
+          copyCam.addEventListener('click', () => {
+            navigator.clipboard.writeText(camUrl);
+            alert('iPad Camera pairing link copied!');
+          });
+        }
+
+        const copyWatch = document.getElementById('copy-watch-link');
+        if (copyWatch) {
+          copyWatch.addEventListener('click', () => {
+            navigator.clipboard.writeText(watchUrl);
+            alert('Pixel Viewer pairing link copied!');
+          });
+        }
+      });
+    </script>
+  </body>
+</html>

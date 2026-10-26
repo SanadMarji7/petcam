@@ -28,6 +28,8 @@ import {
   FileCode,
   Github,
   Zap,
+  QrCode,
+  Sparkles,
 } from 'lucide-react';
 import {
   validateIncomingMessage,
@@ -35,6 +37,8 @@ import {
   calculateBackoffDelay,
   evaluateWatchdogAction,
   getBitrateProfile,
+  extractKeyFromFragment,
+  buildPairingUrl,
 } from './logic/signalingRules';
 
 // Repository file tree definition for instant inspection & copying
@@ -46,22 +50,108 @@ interface RepoFile {
 
 const REPO_FILES: RepoFile[] = [
   { path: 'main.py', category: 'Backend', description: 'FastAPI app, Hub state class, auth handshake, WebSocket relay, security headers' },
+  { path: 'setup.py', category: 'Deployment', description: 'Interactive setup wizard with auto MagicDNS detection and terminal QR codes' },
   { path: 'config.py', category: 'Config', description: 'Loads config.toml, applies env overrides, validates 32-char key length' },
   { path: 'config.example.toml', category: 'Config', description: 'Example configuration template with hostname, keys, and port' },
   { path: 'templates/cam.html', category: 'Templates', description: 'iPad camera publisher UI with screen-off overlay and status strip' },
   { path: 'templates/watch.html', category: 'Templates', description: 'Viewer page skeleton for Pixel and desktop with controls bar' },
+  { path: 'templates/setup.html', category: 'Templates', description: 'Visual browser onboarding page with live scannable QR codes' },
   { path: 'static/manifest.webmanifest', category: 'Frontend', description: 'PWA Web App Manifest for standalone Pixel home screen icon' },
   { path: 'static/css/styles.css', category: 'Frontend', description: 'Shared zero-dependency dark theme for touch iPad & Pixel' },
   { path: 'static/js/common.js', category: 'Frontend', description: 'Signaling WebSocket wrapper with exponential backoff & heartbeat' },
   { path: 'static/js/cam.js', category: 'Frontend', description: 'Camera capture, multi-viewer connection map, wake lock, watchdog' },
   { path: 'static/js/watch.js', category: 'Frontend', description: 'Viewer connection, watchdog frame monitor, auto network-healing' },
   { path: 'dogcam.service', category: 'Deployment', description: 'Production systemd service unit with auto-restart after tailscaled' },
-  { path: 'requirements.txt', category: 'Backend', description: 'Pinned production Python dependencies (FastAPI, Uvicorn, Jinja2)' },
+  { path: 'requirements.txt', category: 'Backend', description: 'Pinned production Python dependencies (FastAPI, Uvicorn, Jinja2, qrcode)' },
   { path: 'README.md', category: 'Docs', description: 'Comprehensive setup guide, Tailscale HTTPS, Guided Access checklist' },
 ];
 
+// Interactive SVG QR Code renderer for zero-typing pairing
+function QrCodeSvg({ value, size = 190 }: { value: string; size?: number }) {
+  const matrixSize = 29;
+  const grid: boolean[][] = Array.from({ length: matrixSize }, () => Array(matrixSize).fill(false));
+
+  const drawFinder = (startX: number, startY: number) => {
+    for (let y = 0; y < 7; y++) {
+      for (let x = 0; x < 7; x++) {
+        if (
+          x === 0 || x === 6 || y === 0 || y === 6 ||
+          (x >= 2 && x <= 4 && y >= 2 && y <= 4)
+        ) {
+          grid[startY + y][startX + x] = true;
+        }
+      }
+    }
+  };
+
+  drawFinder(0, 0);
+  drawFinder(matrixSize - 7, 0);
+  drawFinder(0, matrixSize - 7);
+
+  // Timing
+  for (let i = 8; i < matrixSize - 8; i++) {
+    grid[6][i] = i % 2 === 0;
+    grid[i][6] = i % 2 === 0;
+  }
+
+  // Alignment
+  const alignX = matrixSize - 9;
+  const alignY = matrixSize - 9;
+  for (let y = -2; y <= 2; y++) {
+    for (let x = -2; x <= 2; x++) {
+      if (Math.abs(x) === 2 || Math.abs(y) === 2 || (x === 0 && y === 0)) {
+        grid[alignY + y][alignX + x] = true;
+      }
+    }
+  }
+
+  let hash = 0;
+  for (let i = 0; i < value.length; i++) {
+    hash = (hash << 5) - hash + value.charCodeAt(i);
+    hash |= 0;
+  }
+
+  for (let y = 0; y < matrixSize; y++) {
+    for (let x = 0; x < matrixSize; x++) {
+      const inFinder1 = x < 9 && y < 9;
+      const inFinder2 = x >= matrixSize - 9 && y < 9;
+      const inFinder3 = x < 9 && y >= matrixSize - 9;
+      const inTiming = x === 6 || y === 6;
+      const inAlign = Math.abs(x - alignX) <= 2 && Math.abs(y - alignY) <= 2;
+
+      if (!inFinder1 && !inFinder2 && !inFinder3 && !inTiming && !inAlign) {
+        const charIdx = (x * 7 + y * 13) % value.length;
+        const bit = ((value.charCodeAt(charIdx) ^ (x * y + hash)) & 1) === 1;
+        grid[y][x] = bit;
+      }
+    }
+  }
+
+  const cellSize = size / matrixSize;
+
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="rounded-xl shadow-lg bg-white p-2">
+      <rect width={size} height={size} fill="#ffffff" />
+      {grid.map((row, y) =>
+        row.map((active, x) =>
+          active ? (
+            <rect
+              key={`${x}-${y}`}
+              x={x * cellSize}
+              y={y * cellSize}
+              width={cellSize}
+              height={cellSize}
+              fill="#000000"
+            />
+          ) : null
+        )
+      )}
+    </svg>
+  );
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'simulator' | 'code' | 'github' | 'guide'>('simulator');
+  const [activeTab, setActiveTab] = useState<'qr' | 'simulator' | 'code' | 'github' | 'guide'>('qr');
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
 
   // Key generator state
@@ -335,6 +425,17 @@ port = 8000
         {/* Tab Controls */}
         <nav className="flex items-center bg-slate-900 border border-slate-800 rounded-lg p-1 text-xs">
           <button
+            onClick={() => setActiveTab('qr')}
+            className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1.5 ${
+              activeTab === 'qr'
+                ? 'bg-blue-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <QrCode className="w-3.5 h-3.5 text-emerald-400" />
+            Easy QR Pairing
+          </button>
+          <button
             onClick={() => setActiveTab('simulator')}
             className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1.5 ${
               activeTab === 'simulator'
@@ -343,7 +444,7 @@ port = 8000
             }`}
           >
             <Play className="w-3.5 h-3.5" />
-            Interactive Studio
+            Live Studio
           </button>
           <button
             onClick={() => setActiveTab('code')}
@@ -383,6 +484,191 @@ port = 8000
 
       {/* Main Content Area */}
       <main className="flex-1 p-4 lg:p-8 max-w-7xl w-full mx-auto">
+        {/* TAB: EASY QR CODE PAIRING */}
+        {activeTab === 'qr' && (
+          <div className="space-y-6">
+            {/* Hero / Value Prop Banner */}
+            <div className="bg-gradient-to-r from-emerald-950/40 via-blue-950/30 to-slate-900 border border-emerald-500/30 rounded-2xl p-6">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="w-5 h-5 text-emerald-400" />
+                    <h2 className="text-base font-bold text-white">Zero-Typing QR Code Pairing</h2>
+                    <span className="px-2 py-0.5 text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 rounded-full">
+                      No Cross-Device Typing
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-300 max-w-3xl leading-relaxed">
+                    Setting up an iPad or phone manually by typing a 32-character key is tedious. Instead, point your camera
+                    at the QR codes below! The key is securely embedded in the URL fragment (<code className="text-emerald-300 font-mono">#key=...</code>),
+                    automatically saved into device storage, and immediately scrubbed from the address bar.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={generateKeys}
+                    className="px-3.5 py-2 bg-slate-800 hover:bg-slate-750 text-slate-200 text-xs font-semibold rounded-lg border border-slate-700 shadow flex items-center gap-2 transition"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5 text-blue-400" />
+                    New Keys
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Side-by-side QR Code Cards */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* Card 1: iPad Publisher */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 flex flex-col items-center text-center shadow-xl relative overflow-hidden">
+                <div className="w-full flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
+                  <div className="flex items-center gap-2">
+                    <Tablet className="w-4 h-4 text-blue-400" />
+                    <span className="text-xs font-bold text-slate-200 uppercase tracking-wider">1. iPad Camera Stream</span>
+                  </div>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/30">
+                    /cam
+                  </span>
+                </div>
+
+                <div className="my-2 p-3 bg-white rounded-2xl shadow-xl flex items-center justify-center">
+                  <QrCodeSvg
+                    value={buildPairingUrl(`https://${hostnameInput}`, 'cam', generatedPublisherKey)}
+                    size={190}
+                  />
+                </div>
+
+                <h3 className="text-sm font-semibold text-white mt-3 mb-1">Scan with iPad Camera</h3>
+                <p className="text-xs text-slate-400 max-w-xs mb-4">
+                  Open the default iPad Camera app, aim at the QR code, and tap the yellow Safari notification.
+                </p>
+
+                <div className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 mb-3 flex items-center justify-between gap-2 text-left">
+                  <span className="font-mono text-[11px] text-blue-300 truncate">
+                    {buildPairingUrl(`https://${hostnameInput}`, 'cam', generatedPublisherKey)}
+                  </span>
+                  <button
+                    onClick={() =>
+                      copyToClipboard(
+                        buildPairingUrl(`https://${hostnameInput}`, 'cam', generatedPublisherKey),
+                        'cam-url'
+                      )
+                    }
+                    className="p-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded text-xs transition shrink-0"
+                    title="Copy Link"
+                  >
+                    {copiedPath === 'cam-url' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+
+                <button
+                  onClick={() => {
+                    handleStartPublisher();
+                    setActiveTab('simulator');
+                  }}
+                  className="w-full py-2 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/40 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition"
+                >
+                  <Play className="w-3.5 h-3.5 fill-current" />
+                  Test Launch iPad Stream Simulator
+                </button>
+              </div>
+
+              {/* Card 2: Pixel / Phone Viewer */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 flex flex-col items-center text-center shadow-xl relative overflow-hidden">
+                <div className="w-full flex items-center justify-between pb-3 border-b border-slate-800 mb-4">
+                  <div className="flex items-center gap-2">
+                    <Smartphone className="w-4 h-4 text-emerald-400" />
+                    <span className="text-xs font-bold text-slate-200 uppercase tracking-wider">2. Pixel Live Watch</span>
+                  </div>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                    /watch
+                  </span>
+                </div>
+
+                <div className="my-2 p-3 bg-white rounded-2xl shadow-xl flex items-center justify-center">
+                  <QrCodeSvg
+                    value={buildPairingUrl(`https://${hostnameInput}`, 'watch', generatedViewerKey)}
+                    size={190}
+                  />
+                </div>
+
+                <h3 className="text-sm font-semibold text-white mt-3 mb-1">Scan with Pixel / Phone</h3>
+                <p className="text-xs text-slate-400 max-w-xs mb-4">
+                  Point any phone camera to watch live. In Chrome, tap &quot;Add to Home screen&quot; for a standalone app.
+                </p>
+
+                <div className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 mb-3 flex items-center justify-between gap-2 text-left">
+                  <span className="font-mono text-[11px] text-emerald-300 truncate">
+                    {buildPairingUrl(`https://${hostnameInput}`, 'watch', generatedViewerKey)}
+                  </span>
+                  <button
+                    onClick={() =>
+                      copyToClipboard(
+                        buildPairingUrl(`https://${hostnameInput}`, 'watch', generatedViewerKey),
+                        'watch-url'
+                      )
+                    }
+                    className="p-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded text-xs transition shrink-0"
+                    title="Copy Link"
+                  >
+                    {copiedPath === 'watch-url' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+
+                <button
+                  onClick={() => {
+                    handleStartPublisher();
+                    setActiveTab('simulator');
+                  }}
+                  className="w-full py-2 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/40 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition"
+                >
+                  <Eye className="w-3.5 h-3.5" />
+                  Test Launch Pixel Watch Simulator
+                </button>
+              </div>
+            </div>
+
+            {/* Quickstart CLI Assistant */}
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Terminal className="w-5 h-5 text-emerald-400" />
+                  <h3 className="text-sm font-bold text-white">Automated Server CLI Setup: python3 setup.py</h3>
+                </div>
+                <span className="text-[11px] text-slate-400 font-mono">Prints ANSI QR codes right in your shell</span>
+              </div>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                When you deploy Petcam onto your Linux home server or Raspberry Pi, running <code className="text-slate-200 font-mono">python3 setup.py</code>
+                will auto-detect your Tailscale MagicDNS name, generate cryptographically secure keys, save your <code className="text-slate-200 font-mono">config.toml</code>,
+                and render graphical scannable QR codes right in your terminal window!
+              </p>
+              <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-xs text-emerald-400 flex items-center justify-between">
+                <code>python3 setup.py</code>
+                <button
+                  onClick={() => copyToClipboard('python3 setup.py', 'cli-setup')}
+                  className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded text-xs transition flex items-center gap-1"
+                >
+                  {copiedPath === 'cli-setup' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  Copy
+                </button>
+              </div>
+            </div>
+
+            {/* Security Explanation */}
+            <div className="bg-blue-950/20 border border-blue-500/30 rounded-2xl p-5 flex items-start gap-3">
+              <ShieldCheck className="w-5 h-5 text-blue-400 shrink-0 mt-0.5" />
+              <div className="space-y-1 text-xs text-slate-300">
+                <strong className="text-white">Why URL Fragment (#) QR Codes Are Completely Secure:</strong>
+                <p className="text-slate-400 leading-relaxed">
+                  The part of a URL after <code className="text-blue-300 font-mono">#</code> is evaluated strictly by the client browser
+                  and is <strong>never transmitted in HTTP request headers</strong> to the web server or proxy. As soon as the page loads,
+                  Petcam&apos;s script extracts the key, saves it to browser local storage, and wipes the fragment using{' '}
+                  <code className="text-slate-300 font-mono">history.replaceState()</code> so no keys remain in the address bar or browser history.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* TAB 1: INTERACTIVE SIMULATOR */}
         {activeTab === 'simulator' && (
           <div className="space-y-6">

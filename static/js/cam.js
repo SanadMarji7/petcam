@@ -56,6 +56,19 @@
 
   // 1. Initialization and Key Management
   function init() {
+    // Check if key is provided via URL fragment (e.g. from QR code scan: /cam#key=...)
+    if (window.location.hash) {
+      const hash = window.location.hash.substring(1);
+      const params = new URLSearchParams(hash);
+      const urlKey = params.get('key') || (hash.length >= 32 && !hash.includes('=') ? hash : null);
+      if (urlKey && urlKey.length >= 32) {
+        publisherKey = urlKey;
+        localStorage.setItem(STORAGE_KEY, publisherKey);
+        window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
+        log('info', 'Publisher key imported seamlessly from QR code link');
+      }
+    }
+
     if (publisherKey) {
       keySection?.classList.add('hidden');
       controlsSection?.classList.remove('hidden');

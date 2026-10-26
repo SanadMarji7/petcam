@@ -100,3 +100,38 @@ export function getBitrateProfile(mode: 'auto' | 'high'): { maxBitrate: number; 
     label: 'Auto (800 kbps, 15 fps)',
   };
 }
+
+/**
+ * Extracts authentication key from URL hash fragment (e.g. #key=secret_value or #secret_value)
+ * Never transmitted to server; purely client-side extracted
+ */
+export function extractKeyFromFragment(hash: string): string | null {
+  if (!hash) return null;
+  const cleaned = hash.startsWith('#') ? hash.substring(1) : hash;
+  if (!cleaned) return null;
+
+  // Case 1: Standard param format #key=...
+  if (cleaned.includes('=')) {
+    const params = new URLSearchParams(cleaned);
+    const keyVal = params.get('key');
+    if (keyVal && keyVal.trim().length >= 32) {
+      return keyVal.trim();
+    }
+  }
+
+  // Case 2: Bare token #<32-char-token>
+  if (cleaned.length >= 32 && !cleaned.includes('&')) {
+    return cleaned.trim();
+  }
+
+  return null;
+}
+
+/**
+ * Builds secure pairing URL with fragment-encoded key
+ */
+export function buildPairingUrl(baseUrl: string, role: 'cam' | 'watch', key: string): string {
+  const cleanBase = baseUrl.replace(/\/+$/, '');
+  const path = role === 'cam' ? '/cam' : '/watch';
+  return `${cleanBase}${path}#key=${encodeURIComponent(key)}`;
+}

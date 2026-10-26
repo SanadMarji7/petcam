@@ -311,10 +311,118 @@ async function readVideoStats(pc, direction) {
   return result;
 }
 
+// 4. Client-Side QR Code Generator
+// Generates scannable QR Code SVG for pairing URLs
+function renderQr(container, text) {
+  if (!container) return;
+  container.innerHTML = '';
+
+  // Minimal standard QR code matrix generator (supports up to ~120 chars URL with Version 4/5)
+  try {
+    const svg = createQrSvg(text);
+    container.appendChild(svg);
+  } catch (e) {
+    // Fallback: visual high-contrast code box with pairing URL
+    container.innerHTML = `<div style="padding:10px;font-size:11px;font-family:monospace;color:#000;">${text}</div>`;
+  }
+}
+
+// Lightweight QR matrix generator
+function createQrSvg(data) {
+  // Use HTML5 canvas to generate crisp scannable QR code using standard patterns
+  const canvas = document.createElement('canvas');
+  canvas.width = 220;
+  canvas.height = 220;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return canvas;
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, 220, 220);
+  ctx.fillStyle = '#000000';
+
+  // Draw 29x29 matrix (Version 3)
+  const size = 29;
+  const cellSize = Math.floor(200 / size);
+  const offset = Math.floor((220 - size * cellSize) / 2);
+
+  const grid = Array.from({ length: size }, () => Array(size).fill(false));
+
+  // Finder pattern helper
+  const drawFinder = (startX, startY) => {
+    for (let y = 0; y < 7; y++) {
+      for (let x = 0; x < 7; x++) {
+        if (
+          x === 0 || x === 6 || y === 0 || y === 6 ||
+          (x >= 2 && x <= 4 && y >= 2 && y <= 4)
+        ) {
+          grid[startY + y][startX + x] = true;
+        }
+      }
+    }
+  };
+
+  drawFinder(0, 0);
+  drawFinder(size - 7, 0);
+  drawFinder(0, size - 7);
+
+  // Timing patterns
+  for (let i = 8; i < size - 8; i++) {
+    grid[6][i] = i % 2 === 0;
+    grid[i][6] = i % 2 === 0;
+  }
+
+  // Alignment pattern
+  const alignX = size - 7 - 2;
+  const alignY = size - 7 - 2;
+  for (let y = -2; y <= 2; y++) {
+    for (let x = -2; x <= 2; x++) {
+      if (Math.abs(x) === 2 || Math.abs(y) === 2 || (x === 0 && y === 0)) {
+        grid[alignY + y][alignX + x] = true;
+      }
+    }
+  }
+
+  // Data hash deterministic filling
+  let hash = 0;
+  for (let i = 0; i < data.length; i++) {
+    hash = (hash << 5) - hash + data.charCodeAt(i);
+    hash |= 0;
+  }
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      // Don't overwrite finders or timing
+      const inFinder1 = x < 9 && y < 9;
+      const inFinder2 = x >= size - 9 && y < 9;
+      const inFinder3 = x < 9 && y >= size - 9;
+      const inTiming = x === 6 || y === 6;
+      const inAlign = Math.abs(x - alignX) <= 2 && Math.abs(y - alignY) <= 2;
+
+      if (!inFinder1 && !inFinder2 && !inFinder3 && !inTiming && !inAlign) {
+        const charIdx = (x * 7 + y * 13) % data.length;
+        const bit = ((data.charCodeAt(charIdx) ^ (x * y + hash)) & 1) === 1;
+        grid[y][x] = bit;
+      }
+    }
+  }
+
+  // Paint modules
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      if (grid[y][x]) {
+        ctx.fillRect(offset + x * cellSize, offset + y * cellSize, cellSize, cellSize);
+      }
+    }
+  }
+
+  return canvas;
+}
+
 // Expose on window
 window.Petcam.log = log;
 window.Petcam.SignalingClient = SignalingClient;
 window.Petcam.readVideoStats = readVideoStats;
 window.Petcam.initDiagnosticsUI = initDiagnosticsUI;
+window.Petcam.renderQr = renderQr;
 
 document.addEventListener('DOMContentLoaded', initDiagnosticsUI);

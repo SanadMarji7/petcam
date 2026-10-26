@@ -307,6 +307,22 @@ async def get_watch_page(request: Request) -> Response:
     return templates.TemplateResponse("watch.html", {"request": request})
 
 
+@app.get("/setup", response_class=HTMLResponse)
+async def get_setup_page(request: Request) -> Response:
+    # Build secure pairing URLs with fragment-encoded keys
+    cam_url = f"https://{settings.hostname}/cam#key={settings.publisher_key}"
+    watch_url = f"https://{settings.hostname}/watch#key={settings.viewer_key}"
+    return templates.TemplateResponse(
+        "setup.html",
+        {
+            "request": request,
+            "hostname": settings.hostname,
+            "cam_url": cam_url,
+            "watch_url": watch_url,
+        },
+    )
+
+
 @app.get("/healthz")
 async def get_healthz() -> dict[str, object]:
     return await hub.get_health()
