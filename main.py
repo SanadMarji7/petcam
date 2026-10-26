@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
+import re
 import secrets
+import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -57,6 +60,12 @@ STATS_LOG_INTERVAL_SECONDS = 60.0
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 # Fields a client may attach to a relayed message. Everything else is dropped.
 RELAY_FIELDS = ("sdp", "candidate", "session", "restart")
+# Browsers hide host candidates behind random mDNS names ("<uuid>.local") on
+# pages without camera permission (the viewer) and, on iOS, for VPN interfaces.
+# Those names cannot be resolved across the tailnet, so the relay swaps them for
+# the sender's Tailscale IP, which the server learns from tailscale serve.
+MDNS_NAME = re.compile(r"\b[0-9a-fA-F-]{8,}\.local\b")
+TAILSCALE_NETWORKS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
 
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
@@ -101,6 +110,59 @@ def is_local_request(request: Request) -> bool:
     host = request.client.host if request.client else ""
     forwarded = any(name in request.headers for name in ("x-forwarded-for", "x-forwarded-host", "forwarded"))
     return host in ("127.0.0.1", "::1") and not forwarded
+
+
+def is_tailscale_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in TAILSCALE_NETWORKS)
+
+
+def detect_server_tailscale_ip() -> str:
+    """This machine's own Tailscale IPv4, for pages opened on the server itself."""
+    try:
+        out = subprocess.check_output(["tailscale", "ip", "-4"], text=True, stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        return ""
+    ip = out.strip().splitlines()[0].strip() if out.strip() else ""
+    return ip if is_tailscale_ip(ip) else ""
+
+
+def routable_ip(client_ip: str, server_tailscale_ip: str) -> str:
+    """The address other tailnet devices can reach this client on, or '' if unknown."""
+    if is_tailscale_ip(client_ip):
+        return client_ip
+    if client_ip in ("127.0.0.1", "::1") and server_tailscale_ip:
+        return server_tailscale_ip
+    return ""
+
+
+def unmask_mdns(payload: Message, ip: str) -> Message:
+    """Replace '<uuid>.local' in an offer/answer SDP or an ICE candidate with `ip`."""
+    if not ip:
+        return payload
+    result = dict(payload)
+    sdp = result.get("sdp")
+    if isinstance(sdp, str) and ".local" in sdp:
+        result["sdp"] = MDNS_NAME.sub(ip, sdp)
+    candidate = result.get("candidate")
+    if isinstance(candidate, dict) and isinstance(candidate.get("candidate"), str) and ".local" in candidate["candidate"]:
+        candidate = dict(candidate)
+        candidate["candidate"] = MDNS_NAME.sub(ip, candidate["candidate"])
+        result["candidate"] = candidate
+    return result
+
+
+def has_real_candidate(payload: Message) -> bool:
+    """False for end-of-candidates signals (empty string), which make Safari throw."""
+    candidate = payload.get("candidate")
+    if candidate is None:
+        return False
+    if isinstance(candidate, dict):
+        return bool(str(candidate.get("candidate") or "").strip())
+    return bool(str(candidate).strip())
 
 
 def parse_message(raw: str) -> Message | None:
@@ -155,7 +217,7 @@ async def authenticate(websocket: WebSocket, expected_key: str, role: Role, ip: 
     return client_id
 
 
-async def handle_publisher_message(hub: Hub, client: Client, message: Message) -> None:
+async def handle_publisher_message(hub: Hub, client: Client, message: Message, reachable_ip: str) -> None:
     kind = message["type"]
     if kind == "ping":
         await client.send({"type": "pong"})
@@ -165,29 +227,34 @@ async def handle_publisher_message(hub: Hub, client: Client, message: Message) -
         if not isinstance(viewer_id, str) or not viewer_id:
             logger.warning("[%s] '%s' without viewer_id dropped", client.tag, kind)
             return
-        payload = relay_payload(message)
+        payload = unmask_mdns(relay_payload(message), reachable_ip)
         if kind == "offer" and not isinstance(payload.get("sdp"), str):
             logger.warning("[%s] offer without sdp dropped", client.tag)
+            return
+        if kind == "ice" and not has_real_candidate(payload):
             return
         await hub.to_viewer(viewer_id, {"type": kind, **payload})
         return
     logger.warning("[%s] unknown message type '%s' dropped", client.tag, kind)
 
 
-async def handle_viewer_message(hub: Hub, client: Client, message: Message) -> None:
+async def handle_viewer_message(hub: Hub, client: Client, message: Message, reachable_ip: str) -> None:
     kind = message["type"]
     if kind == "ping":
         await client.send({"type": "pong"})
     elif kind == "join":
         await hub.viewer_join(client)
     elif kind == "answer":
-        payload = relay_payload(message)
+        payload = unmask_mdns(relay_payload(message), reachable_ip)
         if not isinstance(payload.get("sdp"), str):
             logger.warning("[%s] answer without sdp dropped", client.tag)
             return
         await hub.to_publisher({"type": "answer", "viewer_id": client.id, **payload})
     elif kind == "ice":
-        await hub.to_publisher({"type": "ice", "viewer_id": client.id, **relay_payload(message)})
+        payload = unmask_mdns(relay_payload(message), reachable_ip)
+        if not has_real_candidate(payload):
+            return
+        await hub.to_publisher({"type": "ice", "viewer_id": client.id, **payload})
     elif kind == "restart":
         await hub.to_publisher({"type": "viewer_restart", "viewer_id": client.id})
     elif kind == "quality":
@@ -199,7 +266,7 @@ async def handle_viewer_message(hub: Hub, client: Client, message: Message) -> N
         logger.warning("[%s] unknown message type '%s' dropped", client.tag, kind)
 
 
-async def run_session(websocket: WebSocket, role: Role, settings: Settings, hub: Hub) -> None:
+async def run_session(websocket: WebSocket, role: Role, settings: Settings, hub: Hub, server_tailscale_ip: str = "") -> None:
     ip = websocket.client.host if websocket.client else "unknown"
     if not origin_allowed(websocket.headers.get("origin"), settings.hostname):
         logger.warning("[%s] rejected origin %r from %s", role, websocket.headers.get("origin"), ip)
@@ -213,6 +280,9 @@ async def run_session(websocket: WebSocket, role: Role, settings: Settings, hub:
         return
 
     client = Client(socket=websocket, role=role, id=client_id, ip=ip)
+    reachable_ip = routable_ip(ip, server_tailscale_ip)
+    if reachable_ip:
+        logger.info("[%s] mDNS candidates will be rewritten to %s", client.tag, reachable_ip)
     if role == "publisher":
         await hub.attach_publisher(client)
     elif not await hub.attach_viewer(client):
@@ -229,9 +299,9 @@ async def run_session(websocket: WebSocket, role: Role, settings: Settings, hub:
                 logger.warning("[%s] dropped an invalid or oversized message", client.tag)
                 continue
             if role == "publisher":
-                await handle_publisher_message(hub, client, message)
+                await handle_publisher_message(hub, client, message, reachable_ip)
             else:
-                await handle_viewer_message(hub, client, message)
+                await handle_viewer_message(hub, client, message, reachable_ip)
     except WebSocketDisconnect as exc:
         logger.info("[%s] disconnected (code %s)", client.tag, exc.code)
     except RuntimeError:
@@ -273,11 +343,13 @@ async def heartbeat_watchdog(hub: Hub) -> None:
 def create_app(settings: Settings) -> FastAPI:
     hub = Hub(max_viewers=settings.max_viewers)
     templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+    server_tailscale_ip = detect_server_tailscale_ip()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        logger.info("Petcam starting: hostname=%s max_viewers=%d stun=%s port=%d",
-                    settings.hostname, settings.max_viewers, settings.stun_enabled, settings.port)
+        logger.info("Petcam starting: hostname=%s max_viewers=%d stun=%s port=%d tailscale_ip=%s",
+                    settings.hostname, settings.max_viewers, settings.stun_enabled, settings.port,
+                    server_tailscale_ip or "none")
         watchdog = asyncio.create_task(heartbeat_watchdog(hub))
         try:
             yield
@@ -342,11 +414,11 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.websocket("/ws/publisher")
     async def publisher_socket(websocket: WebSocket) -> None:
-        await run_session(websocket, "publisher", settings, hub)
+        await run_session(websocket, "publisher", settings, hub, server_tailscale_ip)
 
     @app.websocket("/ws/viewer")
     async def viewer_socket(websocket: WebSocket) -> None:
-        await run_session(websocket, "viewer", settings, hub)
+        await run_session(websocket, "viewer", settings, hub, server_tailscale_ip)
 
     return app
 

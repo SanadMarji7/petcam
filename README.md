@@ -140,7 +140,7 @@ The same viewer key works on every viewer device. The server allows `max_viewers
 ## 8. How it works and what is secured
 
 - **Signaling** (`/ws/publisher`, `/ws/viewer`): the first message on every socket must carry the right key (constant-time comparison, 5-second deadline). The `Origin` header must match the configured hostname. Wrong keys close the socket with code 4401 and are logged with the source IP. Messages are limited to 64 KB and only a fixed set of fields is relayed.
-- **Media** never touches the server. The iPad offers; each viewer answers. Both sides prefer H.264 so the iPad uses its hardware encoder. The browsers' host candidates include the Tailscale IPs, so the direct path works from anywhere the tailnet reaches. With `stun_enabled = true` (default) the Google STUN server is also offered, which helps when a device sits behind an unusual NAT; set it to `false` to keep media strictly on Tailscale addresses. No TURN server is needed or supported.
+- **Media** never touches the server. The iPad offers; each viewer answers. Both sides prefer H.264 so the iPad uses its hardware encoder. Browsers hide their addresses behind random `<uuid>.local` mDNS names, which cannot be resolved across the tailnet; the relay replaces those names with the sender's Tailscale IP (known from `tailscale serve`) so the two devices can find each other directly. With `stun_enabled = true` (default) the Google STUN server is also offered, which helps when a device sits behind an unusual NAT; set it to `false` to keep media strictly on Tailscale addresses. No TURN server is needed or supported.
 - **Pairing links** put the key in the URL fragment (`#key=`), which browsers never send to the server, so it does not appear in any log.
 - **Headers**: `Cache-Control: no-store`, a strict Content-Security-Policy (same-origin scripts only), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`.
 - **Liveness**: clients ping every 10 s; the server drops anything silent for 30 s. A phone that reconnects (reload, network change) replaces its previous session instead of counting twice.
@@ -161,6 +161,7 @@ Long-press the status strip on either page to open the on-page diagnostic log. I
 | `/setup` says "local only" | Opened over the tailnet | Open it on the server (`http://127.0.0.1:8000/setup`) or use `python3 setup.py`. |
 | Server will not start: "Configuration error" | Missing or placeholder keys / hostname | Run `python3 setup.py`; the message says exactly which value is wrong. |
 | Media path shows `srflx` instead of `host 100.x` | The Tailscale path was not usable, so STUN found another route | Works, but check Tailscale on both devices; set `stun_enabled = false` to force the tailnet. |
+| Log shows only `.local` candidates and `ICE failed` | The page was not opened through `tailscale serve`, so the server does not know the device's Tailscale IP | Use the `https://<name>.ts.net` address on both devices; the server log should say "mDNS candidates will be rewritten to 100.x". |
 
 After changing `config.toml`, restart the server (`sudo systemctl restart dogcam`).
 

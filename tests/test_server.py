@@ -149,7 +149,7 @@ def test_rejects_bad_origin(client: TestClient, settings: Settings) -> None:
     assert info.value.code == 1008
 
 
-def test_auth_failures(sockets: ExitStack, client: TestClient, settings: Settings) -> None:
+def test_auth_failures(client: TestClient, sockets: ExitStack, settings: Settings) -> None:
     ws = connect(sockets, client, "viewer", "wrong-key")
     assert close_code(ws) == CLOSE_UNAUTHORIZED
 
@@ -173,7 +173,7 @@ def test_auth_timeout(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> No
             assert close_code(ws) == CLOSE_TIMEOUT
 
 
-def test_full_signaling_exchange(sockets: ExitStack, client: TestClient, settings: Settings) -> None:
+def test_full_signaling_exchange(client: TestClient, sockets: ExitStack, settings: Settings) -> None:
     pub = connect(sockets, client, "publisher", settings.publisher_key, device_id="ipad")
     assert pub.receive_json() == {"type": "auth_ok", "id": "ipad"}
 
@@ -222,7 +222,7 @@ def test_full_signaling_exchange(sockets: ExitStack, client: TestClient, setting
     assert client.get("/healthz").json()["publisher"] is False
 
 
-def test_viewer_reconnect_with_same_device_keeps_new_session(sockets: ExitStack, client: TestClient, settings: Settings) -> None:
+def test_viewer_reconnect_with_same_device_keeps_new_session(client: TestClient, sockets: ExitStack, settings: Settings) -> None:
     """Regression for the bug that left phones stuck on 'connecting' after a reload."""
     pub = connect(sockets, client, "publisher", settings.publisher_key, device_id="ipad")
     pub.receive_json()
@@ -252,7 +252,7 @@ def test_viewer_reconnect_with_same_device_keeps_new_session(sockets: ExitStack,
     pub.close()
 
 
-def test_viewer_limit_and_publisher_replacement(sockets: ExitStack, client: TestClient, settings: Settings) -> None:
+def test_viewer_limit_and_publisher_replacement(client: TestClient, sockets: ExitStack, settings: Settings) -> None:
     a = connect(sockets, client, "viewer", settings.viewer_key, device_id="a")
     a.receive_json()
     b = connect(sockets, client, "viewer", settings.viewer_key, device_id="b")
@@ -279,3 +279,59 @@ def test_viewer_limit_and_publisher_replacement(sockets: ExitStack, client: Test
     assert b.receive_json() == {"type": "publisher_offline"}
     a.close()
     b.close()
+
+
+# ------------------------------------------------------- mDNS unmasking
+
+
+def test_tailscale_ip_helpers() -> None:
+    from main import has_real_candidate, is_tailscale_ip, routable_ip, unmask_mdns
+
+    assert is_tailscale_ip("100.82.199.26")
+    assert is_tailscale_ip("fd7a:115c:a1e0::6a4e:c71b")
+    assert not is_tailscale_ip("192.168.2.181")
+    assert not is_tailscale_ip("garbage")
+
+    assert routable_ip("100.82.199.26", "") == "100.82.199.26"
+    assert routable_ip("127.0.0.1", "100.1.1.1") == "100.1.1.1"
+    assert routable_ip("127.0.0.1", "") == ""
+    assert routable_ip("192.168.2.181", "100.1.1.1") == ""
+
+    cand = {"candidate": "candidate:1 1 udp 2122 93cbf8bf-b7ea-459e-9221-22c6645bb206.local 5000 typ host", "sdpMid": "0"}
+    out = unmask_mdns({"candidate": cand, "session": "s"}, "100.64.0.5")
+    assert out["candidate"]["candidate"] == "candidate:1 1 udp 2122 100.64.0.5 5000 typ host"
+    assert out["candidate"]["sdpMid"] == "0"
+    assert cand["candidate"].endswith(".local 5000 typ host"), "input not mutated"
+    sdp = "v=0\r\na=candidate:1 1 udp 2122 1c69a762-f518-4a90-9571-a4f2af23325c.local 6000 typ host\r\nc=IN IP4 0.0.0.0\r\n"
+    assert "100.64.0.5 6000" in unmask_mdns({"sdp": sdp}, "100.64.0.5")["sdp"]
+    assert unmask_mdns({"sdp": sdp}, "") == {"sdp": sdp}
+    assert unmask_mdns({"sdp": "a=candidate:1 1 udp 2122 192.168.1.2 7 typ host"}, "100.64.0.5")["sdp"].endswith("192.168.1.2 7 typ host")
+
+    assert has_real_candidate({"candidate": {"candidate": "candidate:1 ..."}})
+    assert not has_real_candidate({"candidate": {"candidate": ""}})
+    assert not has_real_candidate({"candidate": None})
+    assert not has_real_candidate({})
+
+
+def test_relay_unmasks_mdns_for_tailnet_clients(settings: Settings) -> None:
+    with TestClient(create_app(settings), client=("100.64.0.9", 40000)) as client, ExitStack() as sockets:
+        pub = connect(sockets, client, "publisher", settings.publisher_key, device_id="ipad")
+        pub.receive_json()
+        viewer = connect(sockets, client, "viewer", settings.viewer_key, device_id="pixel")
+        viewer.receive_json()
+        viewer.send_json({"type": "join"})
+        viewer.receive_json()
+        pub.receive_json()
+
+        pub.send_json({"type": "offer", "viewer_id": "pixel", "session": "s",
+                       "sdp": "a=candidate:1 1 udp 1 abcdef12-3456.local 9 typ host"})
+        assert viewer.receive_json()["sdp"] == "a=candidate:1 1 udp 1 100.64.0.9 9 typ host"
+
+        viewer.send_json({"type": "ice", "session": "s", "candidate": {"candidate": "candidate:1 1 udp 1 abcdef12-3456.local 9 typ host"}})
+        viewer.send_json({"type": "ice", "session": "s", "candidate": {"candidate": ""}})  # end-of-candidates: dropped
+        viewer.send_json({"type": "ping"})
+        assert pub.receive_json()["candidate"]["candidate"] == "candidate:1 1 udp 1 100.64.0.9 9 typ host"
+        assert viewer.receive_json() == {"type": "pong"}
+        pub.send_json({"type": "ice", "viewer_id": "pixel", "session": "s", "candidate": {"candidate": ""}})
+        pub.send_json({"type": "ping"})
+        assert pub.receive_json() == {"type": "pong"}

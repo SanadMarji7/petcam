@@ -378,7 +378,7 @@
     };
 
     conn.onicecandidate = (event) => {
-      if (pc !== conn || !event.candidate || !signaling) return;
+      if (pc !== conn || !event.candidate || !event.candidate.candidate || !signaling) return; // skip end-of-candidates
       log('info', `Local candidate: ${P.describeCandidate(event.candidate)}`);
       signaling.send({ type: 'ice', session, candidate: event.candidate.toJSON() });
     };
@@ -420,8 +420,9 @@
   }
 
   async function handleRemoteCandidate(msg) {
-    if (!pc || !msg.candidate) return;
+    if (!pc || !msg.candidate || !msg.candidate.candidate) return;
     if (typeof msg.session === 'string' && msg.session !== session) return; // from an older offer
+    log('info', `Remote candidate: ${P.describeCandidate(msg.candidate)}`);
     if (!pc.remoteDescription) {
       pending.push(msg.candidate);
       return;

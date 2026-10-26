@@ -366,7 +366,7 @@
     }
 
     pc.onicecandidate = (event) => {
-      if (!event.candidate || !signaling) return;
+      if (!event.candidate || !event.candidate.candidate || !signaling) return; // skip end-of-candidates
       log('info', `[${viewerId}] local candidate: ${P.describeCandidate(event.candidate)}`);
       signaling.send({ type: 'ice', viewer_id: viewerId, session: peer.session, candidate: event.candidate.toJSON() });
     };
@@ -442,7 +442,8 @@
 
   async function onRemoteCandidate(viewerId, session, candidate) {
     const peer = peers.get(viewerId);
-    if (!peer || peer.session !== session || !candidate) return;
+    if (!peer || peer.session !== session || !candidate || !candidate.candidate) return;
+    log('info', `[${viewerId}] remote candidate: ${P.describeCandidate(candidate)}`);
     if (!peer.pc.remoteDescription) {
       peer.pending.push(candidate);
       return;
