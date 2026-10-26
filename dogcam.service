@@ -1,0 +1,26 @@
+[Unit]
+Description=Petcam WebRTC Dog Monitor Service
+After=network.target tailscaled.service
+Wants=tailscaled.service
+
+[Service]
+Type=simple
+# Replace 'pi' with your server username
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/petcam
+Environment="PATH=/home/pi/petcam/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/pi/petcam/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --workers 1 --log-level info
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# Security sandboxing
+ProtectSystem=full
+ProtectHome=read-only
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Test & Playwright artifacts
+.playwright-cli/
+.aistudio/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+config.toml

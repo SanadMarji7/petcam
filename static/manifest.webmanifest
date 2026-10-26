@@ -1,0 +1,24 @@
+{
+  "name": "Petcam Dog Monitor",
+  "short_name": "Petcam",
+  "description": "Self-hosted WebRTC dog monitor for real-time live video and audio",
+  "start_url": "/watch",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0f19",
+  "theme_color": "#0b0f19",
+  "icons": [
+    {
+      "src": "/static/icon-192.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/static/icon-512.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

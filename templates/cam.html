@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0f19" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>Petcam — Camera Stream</title>
+    <link rel="stylesheet" href="/static/css/styles.css" />
+  </head>
+  <body class="role-cam">
+    <!-- Screen-Off Fullscreen Overlay (#000, covers entire screen to prevent burn-in and save power) -->
+    <div id="screen-off-overlay" class="screen-off-overlay hidden" aria-hidden="true" title="Tap anywhere to wake up screen"></div>
+
+    <div class="app-container">
+      <!-- Top header bar with status strip and forget key -->
+      <header class="header-bar">
+        <div class="brand">
+          <span class="status-indicator" id="status-dot"></span>
+          <span class="title">Petcam Publisher</span>
+        </div>
+        <div class="header-actions">
+          <button id="screen-off-btn" class="btn btn-secondary btn-sm hidden" title="Turn screen black to save power">Screen Off</button>
+          <button id="forget-key-btn" class="btn-text btn-sm" title="Clear stored publisher key">Forget Key</button>
+        </div>
+      </header>
+
+      <!-- Main Stage -->
+      <main class="main-stage">
+        <!-- Video Preview Container (muted, playsinline, autoplay set directly in HTML for iOS Safari) -->
+        <div class="video-container">
+          <video
+            id="local-video"
+            class="video-element"
+            autoplay
+            playsinline
+            muted
+            webkit-playsinline
+          ></video>
+
+          <!-- Pre-start controls card or Auth Key modal -->
+          <div id="setup-card" class="overlay-card">
+            <!-- Key entry form (shown only if key is not yet in localStorage) -->
+            <div id="key-section" class="setup-group">
+              <h2 class="card-heading">Publisher Authentication</h2>
+              <p class="card-subtext">Enter the 32-character publisher key from your home server config.</p>
+              <div class="form-row">
+                <input
+                  type="password"
+                  id="key-input"
+                  class="input-text"
+                  placeholder="Paste 32-character publisher key"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <button id="save-key-btn" class="btn btn-primary">Save Key</button>
+              </div>
+            </div>
+
+            <!-- Pre-start camera options (shown when key is set, hidden after start) -->
+            <div id="controls-section" class="setup-group hidden">
+              <h2 class="card-heading">iPad Camera Setup</h2>
+              <div class="form-group">
+                <label for="camera-select" class="form-label">Select Lens:</label>
+                <select id="camera-select" class="select-input">
+                  <option value="environment" selected>Back Camera (Wide / Environment)</option>
+                  <option value="user">Front Camera (Face)</option>
+                </select>
+              </div>
+
+              <div id="wake-lock-warning" class="banner banner-warning hidden">
+                Screen WakeLock API unavailable on this browser. Use iOS Guided Access with Auto-Lock set to Never to prevent sleep.
+              </div>
+
+              <div id="start-error-msg" class="banner banner-error hidden"></div>
+
+              <button id="start-cam-btn" class="btn btn-primary btn-large">
+                Start Camera
+              </button>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <!-- Bottom Status Bar (Active after camera starts) -->
+      <footer id="publisher-footer" class="status-strip hidden" title="Long press for internal diagnostic log">
+        <div class="status-col">
+          <span class="label">Status:</span>
+          <strong id="stream-status" class="val val-online">Streaming</strong>
+        </div>
+        <div class="status-col">
+          <span class="label">Viewers:</span>
+          <strong id="viewer-count" class="val">0</strong>
+        </div>
+        <div class="status-col">
+          <span class="label">Resolution:</span>
+          <strong id="stat-resolution" class="val">720p @ 15fps</strong>
+        </div>
+        <div class="status-col">
+          <span class="label">Uptime:</span>
+          <strong id="stat-uptime" class="val">00:00:00</strong>
+        </div>
+      </footer>
+    </div>
+
+    <!-- Hidden Log Drawer (Triggered by long-pressing status strip) -->
+    <div id="log-modal" class="log-modal hidden" role="dialog" aria-modal="true" aria-label="Diagnostic Log">
+      <div class="log-modal-content">
+        <div class="log-modal-header">
+          <h3>Diagnostic Event Log</h3>
+          <button id="close-log-btn" class="btn btn-sm">Close</button>
+        </div>
+        <div id="log-entries" class="log-entries"></div>
+      </div>
+    </div>
+
+    <script src="/static/js/common.js"></script>
+    <script src="/static/js/cam.js"></script>
+  </body>
+</html>

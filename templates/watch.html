@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0f19" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>Petcam — Live Watch</title>
+    <link rel="manifest" href="/static/manifest.webmanifest" />
+    <link rel="stylesheet" href="/static/css/styles.css" />
+  </head>
+  <body class="role-watch">
+    <div class="app-container">
+      <!-- Top header bar with status dot, title, and key management -->
+      <header class="header-bar">
+        <div class="brand">
+          <span class="status-indicator" id="status-dot"></span>
+          <span class="title">Petcam Live</span>
+        </div>
+        <div class="header-actions">
+          <button id="forget-key-btn" class="btn-text btn-sm" title="Clear stored viewer key">Forget Key</button>
+        </div>
+      </header>
+
+      <!-- Main Stage -->
+      <main class="main-stage">
+        <div class="video-container" id="video-wrapper">
+          <!-- Full-width incoming video element (autoplay, playsinline, muted initially for Chrome/Android) -->
+          <video
+            id="remote-video"
+            class="video-element"
+            autoplay
+            playsinline
+            muted
+            webkit-playsinline
+          ></video>
+
+          <!-- Centered "Camera is offline" overlay -->
+          <div id="offline-banner" class="center-banner hidden">
+            <div class="center-banner-icon">📹</div>
+            <h2 class="center-banner-title">Camera is offline</h2>
+            <p class="center-banner-desc">Waiting for the iPad publisher to connect. Reconnection will happen automatically.</p>
+          </div>
+
+          <!-- Auth Key Prompt Card (if not in localStorage) -->
+          <div id="key-card" class="overlay-card hidden">
+            <h2 class="card-heading">Viewer Authentication</h2>
+            <p class="card-subtext">Enter the 32-character viewer key to watch the live dog stream.</p>
+            <div class="form-row">
+              <input
+                type="password"
+                id="key-input"
+                class="input-text"
+                placeholder="Paste 32-character viewer key"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <button id="save-key-btn" class="btn btn-primary">Connect</button>
+            </div>
+            <div id="auth-error-msg" class="banner banner-error hidden"></div>
+          </div>
+        </div>
+      </main>
+
+      <!-- Bottom controls bar (mute/unmute, quality toggle, reconnect) -->
+      <div class="controls-bar">
+        <button id="audio-toggle-btn" class="btn btn-control" aria-label="Audio Muted. Click to Unmute">
+          <span id="audio-icon">🔇</span>
+          <span id="audio-text">Unmute</span>
+        </button>
+
+        <button id="quality-toggle-btn" class="btn btn-control" aria-label="Toggle streaming quality mode">
+          <span class="control-tag">Quality:</span>
+          <strong id="quality-mode-text">Auto (800k)</strong>
+        </button>
+
+        <button id="reconnect-btn" class="btn btn-control" aria-label="Reconnect WebRTC stream">
+          <span>🔄</span>
+          <span>Reconnect</span>
+        </button>
+      </div>
+
+      <!-- One-line status strip (Long press opens diagnostic logs) -->
+      <footer id="status-strip" class="status-strip" title="Long press for internal diagnostic log">
+        <div class="status-col">
+          <span class="label">State:</span>
+          <strong id="conn-state" class="val val-connecting">Connecting...</strong>
+        </div>
+        <div class="status-col">
+          <span class="label">ICE:</span>
+          <span id="ice-state" class="val val-sub">new</span>
+        </div>
+        <div class="status-col">
+          <span class="label">Feed:</span>
+          <span id="feed-stats" class="val val-sub">0x0 @ 0fps</span>
+        </div>
+      </footer>
+    </div>
+
+    <!-- Hidden Log Drawer (Triggered by long-pressing status strip) -->
+    <div id="log-modal" class="log-modal hidden" role="dialog" aria-modal="true" aria-label="Diagnostic Log">
+      <div class="log-modal-content">
+        <div class="log-modal-header">
+          <h3>Diagnostic Event Log</h3>
+          <button id="close-log-btn" class="btn btn-sm">Close</button>
+        </div>
+        <div id="log-entries" class="log-entries"></div>
+      </div>
+    </div>
+
+    <script src="/static/js/common.js"></script>
+    <script src="/static/js/watch.js"></script>
+  </body>
+</html>

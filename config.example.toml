@@ -1,0 +1,21 @@
+# Petcam configuration file
+# Copy this to config.toml and replace keys with random 32+ character tokens.
+# Generate keys with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+
+# Tailscale MagicDNS hostname for this server (used for Origin verification)
+hostname = "dogcam.your-tailnet.ts.net"
+
+# 32+ character secret key for the iPad publisher (/cam)
+publisher_key = "CHANGE_ME_TO_32_CHAR_RANDOM_PUBLISHER_KEY"
+
+# 32+ character secret key for viewers (/watch)
+viewer_key = "CHANGE_ME_TO_32_CHAR_RANDOM_VIEWER_KEY"
+
+# Maximum concurrent viewers allowed (default: 4)
+max_viewers = 4
+
+# Fallback STUN server (off by default; Tailscale direct IPs connect directly)
+stun_enabled = false
+
+# Internal port for Uvicorn (tailscale serve will proxy https to 127.0.0.1:port)
+port = 8000

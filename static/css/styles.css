@@ -1,0 +1,481 @@
+/* ==========================================================================
+   Petcam: Self-Hosted WebRTC Dog Cam — Stylesheet
+   Designed for iPad (Publisher) and Pixel / Mobile / Desktop (Viewer)
+   ========================================================================== */
+
+:root {
+  --bg-main: #0b0f19;
+  --bg-surface: #131b2e;
+  --bg-card: #1c2640;
+  --bg-overlay: rgba(11, 15, 25, 0.92);
+  --border-subtle: #2d3b5d;
+  --text-main: #f1f5f9;
+  --text-muted: #94a3b8;
+  --color-brand: #3b82f6;
+  --color-brand-hover: #2563eb;
+  --color-success: #10b981;
+  --color-warning: #f59e0b;
+  --color-danger: #ef4444;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-top: env(safe-area-inset-top, 0px);
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  font-family: var(--font-sans);
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Screen Off Overlay (#000, covers entire screen for iPad unattended run) */
+.screen-off-overlay {
+  position: fixed;
+  inset: 0;
+  background-color: #000000;
+  z-index: 99999;
+  cursor: pointer;
+}
+
+.app-container {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  height: 100dvh;
+  position: relative;
+  background-color: var(--bg-main);
+}
+
+/* Header Bar */
+.header-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: calc(8px + var(--safe-top)) 16px 8px 16px;
+  background-color: rgba(19, 27, 46, 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border-subtle);
+  z-index: 20;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.title {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text-main);
+}
+
+.status-indicator {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background-color: #64748b;
+  box-shadow: 0 0 0 2px rgba(100, 116, 139, 0.3);
+  transition: background-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.status-indicator.online {
+  background-color: var(--color-success);
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.6);
+}
+
+.status-indicator.connecting {
+  background-color: var(--color-warning);
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.6);
+}
+
+.status-indicator.error {
+  background-color: var(--color-danger);
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.6);
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Main Stage & Video Container */
+.main-stage {
+  flex: 1;
+  display: flex;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background-color: #000000;
+  overflow: hidden;
+}
+
+.video-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #000000;
+}
+
+.video-element {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background-color: #000000;
+}
+
+/* Overlay Cards (Authentication & Setup) */
+.overlay-card {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 90%;
+  max-width: 440px;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+  z-index: 30;
+  text-align: center;
+}
+
+.card-heading {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.card-subtext {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  margin-bottom: 20px;
+}
+
+.form-group {
+  margin-bottom: 16px;
+  text-align: left;
+}
+
+.form-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.select-input, .input-text {
+  width: 100%;
+  padding: 12px 14px;
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  color: var(--text-main);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+
+.select-input:focus, .input-text:focus {
+  border-color: var(--color-brand);
+}
+
+.form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 10px 18px;
+  font-size: 14px;
+  font-weight: 600;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-primary {
+  background-color: var(--color-brand);
+  color: #ffffff;
+}
+
+.btn-primary:active {
+  background-color: var(--color-brand-hover);
+  transform: scale(0.98);
+}
+
+.btn-secondary {
+  background-color: var(--bg-surface);
+  color: var(--text-main);
+  border: 1px solid var(--border-subtle);
+}
+
+.btn-secondary:active {
+  background-color: #1e2b47;
+}
+
+.btn-large {
+  width: 100%;
+  min-height: 52px;
+  font-size: 16px;
+  margin-top: 10px;
+}
+
+.btn-sm {
+  min-height: 32px;
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.btn-text {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.btn-text:hover, .btn-text:active {
+  color: var(--text-main);
+}
+
+/* Offline Banner */
+.center-banner {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 24px;
+  background-color: var(--bg-overlay);
+  border: 1px solid var(--border-subtle);
+  border-radius: 16px;
+  max-width: 380px;
+  width: 88%;
+  z-index: 10;
+  pointer-events: none;
+}
+
+.center-banner-icon {
+  font-size: 40px;
+  margin-bottom: 12px;
+}
+
+.center-banner-title {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.center-banner-desc {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+/* Banners (warning / error) */
+.banner {
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  margin-bottom: 12px;
+  text-align: left;
+}
+
+.banner-warning {
+  background-color: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  color: #fbbf24;
+}
+
+.banner-error {
+  background-color: rgba(239, 68, 68, 0.15);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+}
+
+/* Controls Bar (Viewer) */
+.controls-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  padding: 10px 16px;
+  background-color: var(--bg-surface);
+  border-top: 1px solid var(--border-subtle);
+  gap: 10px;
+  z-index: 20;
+}
+
+.btn-control {
+  flex: 1;
+  max-width: 160px;
+  background-color: var(--bg-card);
+  color: var(--text-main);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.btn-control:active {
+  background-color: #243254;
+}
+
+.control-tag {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* Status Strip */
+.status-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 16px calc(6px + var(--safe-bottom)) 16px;
+  background-color: #070b12;
+  border-top: 1px solid #1e293b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+  z-index: 20;
+}
+
+.status-col {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.label {
+  color: var(--text-muted);
+}
+
+.val {
+  color: var(--text-main);
+  font-weight: 500;
+}
+
+.val-online {
+  color: var(--color-success);
+}
+
+.val-connecting {
+  color: var(--color-warning);
+}
+
+.val-error {
+  color: var(--color-danger);
+}
+
+.val-sub {
+  color: #cbd5e1;
+}
+
+/* Diagnostic Log Modal */
+.log-modal {
+  position: fixed;
+  inset: 0;
+  background-color: rgba(0, 0, 0, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100000;
+  padding: 16px;
+}
+
+.log-modal-content {
+  width: 100%;
+  max-width: 600px;
+  height: 80vh;
+  background-color: #0f172a;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.log-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background-color: #1e293b;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.log-modal-header h3 {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.log-entries {
+  flex: 1;
+  padding: 12px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: #94a3b8;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background-color: #0b0f19;
+}
+
+.log-entry {
+  word-break: break-all;
+}
+
+.log-entry.warn {
+  color: #fbbf24;
+}
+
+.log-entry.err {
+  color: #f87171;
+}
+
+/* Utilities */
+.hidden {
+  display: none !important;
+}
