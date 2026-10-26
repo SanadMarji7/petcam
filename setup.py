@@ -29,26 +29,39 @@ def print_banner() -> None:
     print("\033[0m")
 
 
-def detect_tailscale_hostname() -> str:
-    """Attempts to auto-detect Tailscale MagicDNS name using tailscale CLI."""
+def get_tailscale_info() -> tuple[str | None, str | None, str]:
+    """
+    Queries tailscale status to detect the machine's true MagicDNS domain and Tailscale IP.
+    Returns (magicdns_name, tailscale_ip, status_message).
+    """
     try:
         output = subprocess.check_output(["tailscale", "status", "--json"], text=True, stderr=subprocess.DEVNULL)
         data = json.loads(output)
+        backend_state = data.get("BackendState", "")
+
+        if backend_state != "Running":
+            return (None, None, f"Tailscale state is '{backend_state}'. Please run 'sudo tailscale up'.")
+
+        # Check for explicitly assigned certificate domains
+        cert_domains = data.get("CertDomains", [])
+        if cert_domains and cert_domains[0]:
+            return (cert_domains[0], None, "OK")
+
         self_node = data.get("Self", {})
-        dns_name = self_node.get("DNSName", "")
+        dns_name = self_node.get("DNSName", "").rstrip(".")
+        ips = self_node.get("TailscaleIPs", [])
+        ipv4 = ips[0] if ips else None
+
         if dns_name:
-            return dns_name.rstrip(".")
-    except Exception:
-        pass
+            return (dns_name, ipv4, "OK")
+        if ipv4:
+            return (None, ipv4, f"Tailscale connected (IP {ipv4}), but MagicDNS domain name is pending.")
+    except FileNotFoundError:
+        return (None, None, "Tailscale CLI is not installed. Install via: curl -fsSL https://tailscale.com/install.sh | sh")
+    except Exception as e:
+        return (None, None, f"Could not query Tailscale: {e}")
 
-    try:
-        ip = subprocess.check_output(["tailscale", "ip", "-4"], text=True, stderr=subprocess.DEVNULL).strip()
-        if ip:
-            return f"dogcam.{ip}.ts.net"
-    except Exception:
-        pass
-
-    return "dogcam.your-tailnet.ts.net"
+    return (None, None, "Tailscale is not running. Run: sudo tailscale up")
 
 
 def render_terminal_half_blocks(matrix: list[list[bool]], border: int = 2) -> None:
@@ -279,7 +292,16 @@ def main() -> None:
     print_banner()
 
     config_path = Path("config.toml")
-    detected_host = detect_tailscale_hostname()
+    real_host, ts_ip, ts_msg = get_tailscale_info()
+
+    if real_host:
+        print(f"\033[1;32m[✓] Tailscale active:\033[0m Found domain \033[1;36m{real_host}\033[0m")
+    else:
+        print(f"\033[1;33m[!] Tailscale status:\033[0m {ts_msg}")
+
+    hostname = real_host or "dogcam.your-tailnet.ts.net"
+    publisher_key = ""
+    viewer_key = ""
 
     if config_path.exists():
         print("\033[1;32m[✓] Existing config.toml found.\033[0m Loading configuration...")
@@ -289,12 +311,29 @@ def main() -> None:
             hostname = settings.hostname
             publisher_key = settings.publisher_key
             viewer_key = settings.viewer_key
+
+            # If existing config has a placeholder and we found a real Tailscale domain, auto-update!
+            if ("your-tailnet" in hostname or hostname.startswith("dogcam.")) and real_host:
+                print(f"\033[1;33m[*] Upgrading placeholder hostname to your real Tailscale domain: {real_host}\033[0m")
+                hostname = real_host
+                # Rewrite config.toml with real domain
+                config_content = f"""# Petcam configuration file
+# Updated with real Tailscale domain by setup.py
+
+hostname = "{hostname}"
+publisher_key = "{publisher_key}"
+viewer_key = "{viewer_key}"
+max_viewers = 4
+stun_enabled = false
+port = 8000
+"""
+                with open(config_path, "w", encoding="utf-8") as f:
+                    f.write(config_content)
         except Exception as e:
             print(f"\033[1;31m[!] Error parsing config.toml: {e}\033[0m")
             return
     else:
         print("\033[1;33m[*] Creating new config.toml with auto-generated secure keys...\033[0m")
-        hostname = detected_host
         publisher_key = secrets.token_urlsafe(32)
         viewer_key = secrets.token_urlsafe(32)
 
@@ -316,6 +355,14 @@ port = 8000
         with open(config_path, "w", encoding="utf-8") as f:
             f.write(config_content)
         print(f"\033[1;32m[✓] Saved {config_path}\033[0m")
+
+    # Warn if hostname is still a placeholder
+    if "your-tailnet" in hostname:
+        print("\n\033[1;31m" + "!" * 64)
+        print("ATTENTION: Hostname is currently set to placeholder 'dogcam.your-tailnet.ts.net'.")
+        print("Your iPad/phone will report 'server can't be found' until Tailscale is running!")
+        print("Run 'sudo tailscale up' on Fedora, then re-run setup.py.")
+        print("!" * 64 + "\033[0m\n")
 
     cam_pairing_url = f"https://{hostname}/cam#key={publisher_key}"
     watch_pairing_url = f"https://{hostname}/watch#key={viewer_key}"
@@ -379,10 +426,11 @@ port = 8000
 
     print("=" * 64)
     print("\033[1;36mNEXT STEPS:\033[0m")
-    print(f"1. Start Tailscale HTTPS proxy:")
-    print(f"   \033[1;32msudo tailscale serve --bg https / http://127.0.0.1:8000\033[0m")
-    print(f"2. Enable Petcam service on boot:")
-    print(f"   \033[1;32msudo systemctl enable --now dogcam\033[0m")
+    print("1. Start Tailscale HTTPS proxy:")
+    print("   \033[1;32msudo tailscale serve --bg http://127.0.0.1:8000\033[0m")
+    print("2. Start the Petcam server:")
+    print("   \033[1;32muvicorn main:app --host 127.0.0.1 --port 8000\033[0m")
+    print("   (or enable service: sudo systemctl enable --now dogcam)")
     print("=" * 64 + "\n")
 
 

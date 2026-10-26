@@ -106,9 +106,9 @@ WebRTC media capture (`getUserMedia`) requires a secure HTTPS context. Tailscale
    - Enable **HTTPS Certificates**.
 3. **Serve HTTPS via Tailscale Serve:**
    ```bash
-   sudo tailscale serve --bg https / http://127.0.0.1:8000
+   sudo tailscale serve --bg http://127.0.0.1:8000
    ```
-   *Note:* The Uvicorn server listens on `127.0.0.1:8000` only, never on `0.0.0.0`. `tailscale serve` terminates HTTPS and proxies requests securely.
+   *Note:* The modern Tailscale CLI automatically serves HTTPS on port 443 at `/` pointing to your local server on port 8000. Uvicorn listens on `127.0.0.1:8000` only, never on `0.0.0.0`.
    *Fedora Note:* Fedora's `firewalld` requires no open ports because all incoming traffic flows through Tailscale's local proxy.
 4. **Install Tailscale on iPad and Pixel:**
    - Install the official Tailscale app from the App Store / Google Play Store.

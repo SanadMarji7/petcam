@@ -1225,7 +1225,7 @@ git push -u origin main`}</code>
 
               <div className="space-y-3">
                 <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-xs text-emerald-400">
-                  <code>sudo tailscale serve --bg https / http://127.0.0.1:8000</code>
+                  <code>sudo tailscale serve --bg http://127.0.0.1:8000</code>
                 </div>
                 <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-xs text-slate-300">
                   <span className="text-slate-500"># Verify systemd service status:</span>
