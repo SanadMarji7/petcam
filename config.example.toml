@@ -1,22 +1,33 @@
 # Petcam configuration.
 # Easiest: run `python3 setup.py`, which writes config.toml for you.
-# Manual: copy this file to config.toml and fill in the three values below.
-# Generate a key with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+# Manual: copy this file to config.toml and fill in the values below.
+# Generate a pairing key with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+# Every value can also be given as an environment variable (PETCAM_HOSTNAME,
+# PETCAM_PUBLISHER_KEY, ... see config.py), which is what the Docker image uses.
 
-# Tailscale MagicDNS name of this server. Browsers must open exactly this host;
-# the server rejects WebSocket connections from any other origin.
-hostname = "dogcam.your-tailnet.ts.net"
+# Public name browsers use to open this app (the QR codes point here),
+# e.g. app.example.com, or 127.0.0.1:8000 for local development.
+hostname = "app.<domain>"
 
 # Secret pairing keys, at least 32 characters each and different from each other.
+# The camera device gets the publisher key, the people watching get the viewer key.
 publisher_key = "CHANGE_ME_TO_A_RANDOM_32_CHAR_PUBLISHER_KEY"
 viewer_key = "CHANGE_ME_TO_A_RANDOM_32_CHAR_VIEWER_KEY"
+
+# LiveKit server the browsers connect to: wss://lk.<domain> in production,
+# ws://127.0.0.1:7880 for a local `livekit-server --dev`.
+livekit_url = "wss://lk.<domain>"
+
+# API key pair the LiveKit server was configured with (deploy/petcam.env or
+# livekit.yaml). The dev server uses devkey / secret.
+livekit_api_key = "CHANGE_ME_LIVEKIT_API_KEY"
+livekit_api_secret = "CHANGE_ME_LIVEKIT_API_SECRET"
+
+# LiveKit room the camera and the viewers meet in.
+room_name = "petcam"
 
 # How many phones/laptops may watch at the same time.
 max_viewers = 4
 
-# Also offer Google STUN to the browsers. Keep true unless you want media to
-# travel only over Tailscale IPs (then set false).
-stun_enabled = true
-
-# Local port for Uvicorn; `tailscale serve` forwards HTTPS to it.
+# Local port for Uvicorn; the reverse proxy forwards HTTPS to it.
 port = 8000

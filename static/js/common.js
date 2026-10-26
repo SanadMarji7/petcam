@@ -2,24 +2,15 @@
 'use strict';
 
 /**
- * Petcam shared browser code, loaded by /cam and /watch with a plain <script>.
+ * Petcam shared browser code, loaded by /cam and /watch with a plain <script>
+ * after the vendored LiveKit client (static/js/vendor/livekit-client.umd.js).
  *
  *  - log(): console + on-page diagnostic log (long-press the status strip)
- *  - SignalingClient: WebSocket wrapper with auth handshake, heartbeat, backoff
- *  - readVideoStats() / describeSelectedPair(): small getStats() readers
+ *  - requestToken(): asks the control plane for a LiveKit token
  *  - helpers for the pairing key in the URL fragment and the per-device id
  */
 (function () {
   const Petcam = (window.Petcam = window.Petcam || {});
-
-  // Close codes the server uses (see hub.py).
-  const CLOSE = {
-    MALFORMED: 4400,
-    UNAUTHORIZED: 4401,
-    TIMEOUT: 4408,
-    TOO_MANY_VIEWERS: 4409,
-    REPLACED: 4410,
-  };
 
   // --------------------------------------------------------------- logging
 
@@ -67,13 +58,13 @@
     if (!strip || !modal) return;
 
     let timer = null;
-    const start = () => {
-      cancel();
-      timer = setTimeout(() => modal.classList.remove('hidden'), 800);
-    };
     const cancel = () => {
       if (timer) clearTimeout(timer);
       timer = null;
+    };
+    const start = () => {
+      cancel();
+      timer = setTimeout(() => modal.classList.remove('hidden'), 800);
     };
     strip.addEventListener('mousedown', start);
     strip.addEventListener('mouseup', cancel);
@@ -84,20 +75,23 @@
     closeBtn?.addEventListener('click', () => modal.classList.add('hidden'));
   }
 
-  // ------------------------------------------------------------- utilities
+  // ------------------------------------------------------------- key / id
 
-  /** Pull `#key=...` out of the URL (QR pairing), store it and scrub the address bar. */
+  /**
+   * Pull `#key=...` out of the URL (QR pairing), store it and scrub the address bar.
+   *
+   * The key lives in localStorage. Safari deletes script-written storage for a
+   * site after seven days of Safari use without interacting with it (a page
+   * added to the Home Screen is exempt), so the pages rewrite the key on every
+   * connect and the README tells users to add the page to the Home Screen.
+   */
   function takeKeyFromFragment(storageKey) {
     const hash = window.location.hash.replace(/^#/, '');
     if (!hash) return null;
     const params = new URLSearchParams(hash);
     const key = (params.get('key') || '').trim();
     if (key.length < 32) return null;
-    try {
-      localStorage.setItem(storageKey, key);
-    } catch (_) {
-      /* private mode: the key still works for this page load */
-    }
+    storeKey(storageKey, key);
     window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
     log('info', 'Pairing key imported from the QR link');
     return key;
@@ -116,345 +110,107 @@
       if (value) localStorage.setItem(storageKey, value);
       else localStorage.removeItem(storageKey);
     } catch (_) {
-      /* ignore */
+      /* private mode: the value still works for this page load */
     }
+  }
+
+  function randomId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+    }
+    return Math.random().toString(36).slice(2, 14);
   }
 
   /** Stable id per browser so a reload replaces the old session instead of adding one. */
   function getDeviceId(storageKey) {
     let id = readStoredKey(storageKey);
     if (!id) {
-      const rand =
-        window.crypto && typeof window.crypto.randomUUID === 'function'
-          ? window.crypto.randomUUID().replace(/-/g, '').slice(0, 12)
-          : Math.random().toString(36).slice(2, 14);
-      id = 'dev_' + rand;
+      id = 'dev_' + randomId();
       storeKey(storageKey, id);
     }
     return id;
   }
 
-  function randomId() {
-    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
-      return window.crypto.randomUUID().replace(/-/g, '').slice(0, 10);
-    }
-    return Math.random().toString(36).slice(2, 12);
-  }
+  // ---------------------------------------------------------------- token
 
-  /** ICE servers from the server config; falls back to none (Tailscale host candidates). */
-  async function loadIceServers() {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 4000);
-      const res = await fetch('/config.json', { cache: 'no-store', signal: controller.signal });
-      clearTimeout(timer);
-      const data = await res.json();
-      if (data && Array.isArray(data.ice_servers)) {
-        log('info', `ICE servers from config: ${data.ice_servers.length}`);
-        return data.ice_servers;
-      }
-    } catch (err) {
-      log('warn', `Could not load /config.json (${err.message}); using no STUN`);
-    }
-    return [];
-  }
-
-  function rtcConfig(iceServers) {
-    return { iceServers: iceServers, bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' };
-  }
-
-  function describeCandidate(candidate) {
-    if (!candidate) return 'none';
-    const c = candidate.candidate || '';
-    const parts = c.split(' ');
-    // "candidate:... 1 udp 2122 <address> <port> typ host ..."
-    const address = parts.length > 5 ? parts[4] : '?';
-    const typeIdx = parts.indexOf('typ');
-    const type = typeIdx >= 0 ? parts[typeIdx + 1] : candidate.type || '?';
-    return `${type} ${address}`;
-  }
-
-  // ----------------------------------------------------------- signaling
-
-  class SignalingClient {
-    /**
-     * @param {Object} o
-     * @param {'publisher' | 'viewer'} o.role
-     * @param {() => string} o.getKey
-     * @param {() => string} [o.getDeviceId]
-     * @param {(msg: any) => void} o.onMessage
-     * @param {(clientId: string, reconnect: boolean) => void} [o.onOpen]     after auth_ok
-     * @param {(code: number, reason: string) => void} [o.onClose]
-     * @param {(reason: string) => void} [o.onAuthFailed]                     wrong key: no retry
-     * @param {(reason: string) => void} [o.onReplaced]                       newer session took over: no retry
-     * @param {(reason: string) => void} [o.onViewerLimit]                    retried slowly
-     */
-    constructor(o) {
-      this.role = o.role;
-      this.getKey = o.getKey;
-      this.getDeviceId = o.getDeviceId || null;
-      this.onMessage = o.onMessage;
-      this.onOpen = o.onOpen || (() => {});
-      this.onClose = o.onClose || (() => {});
-      this.onAuthFailed = o.onAuthFailed || (() => {});
-      this.onReplaced = o.onReplaced || (() => {});
-      this.onViewerLimit = o.onViewerLimit || (() => {});
-
-      /** @type {WebSocket | null} */
-      this.ws = null;
-      this.clientId = null;
-      this.authenticated = false;
-      this.everAuthenticated = false;
-      this.stopped = false;
-      this.reconnectAttempts = 0;
-      this.reconnectTimer = null;
-      this.heartbeatTimer = null;
-      this.lastPong = 0;
-    }
-
-    get isOpen() {
-      return this.authenticated && !!this.ws && this.ws.readyState === WebSocket.OPEN;
-    }
-
-    connect() {
-      this.stopped = false;
-      this.clearReconnectTimer();
-      const key = this.getKey();
-      if (!key) {
-        log('warn', 'Not connecting: no key');
-        return;
-      }
-      this.disposeSocket();
-
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = `${proto}//${window.location.host}/ws/${this.role}`;
-      log('info', `Signaling: connecting to ${url}`);
-
-      let ws;
-      try {
-        ws = new WebSocket(url);
-      } catch (err) {
-        log('error', `WebSocket could not be created: ${err.message}`);
-        this.scheduleReconnect();
-        return;
-      }
-      this.ws = ws;
-      this.authenticated = false;
-
-      ws.onopen = () => {
-        if (ws !== this.ws) return;
-        const auth = { type: 'auth', key: this.getKey() };
-        if (this.getDeviceId) auth.device_id = this.getDeviceId();
-        this.send(auth);
-      };
-
-      ws.onmessage = (event) => {
-        if (ws !== this.ws) return;
-        let msg;
-        try {
-          msg = JSON.parse(event.data);
-        } catch (_) {
-          log('warn', 'Signaling: ignored a non-JSON frame');
-          return;
-        }
-        if (!msg || typeof msg.type !== 'string') return;
-
-        if (msg.type === 'auth_ok') {
-          const reconnect = this.everAuthenticated;
-          this.authenticated = true;
-          this.everAuthenticated = true;
-          this.clientId = msg.id;
-          this.reconnectAttempts = 0;
-          this.lastPong = Date.now();
-          this.startHeartbeat();
-          log('info', `Signaling: authenticated as ${this.role} [${this.clientId}]${reconnect ? ' (reconnected)' : ''}`);
-          this.onOpen(this.clientId, reconnect);
-          return;
-        }
-        if (msg.type === 'pong') {
-          this.lastPong = Date.now();
-          return;
-        }
-        this.onMessage(msg);
-      };
-
-      ws.onerror = () => {
-        if (ws !== this.ws) return;
-        log('warn', 'Signaling: socket error');
-      };
-
-      ws.onclose = (event) => {
-        if (ws !== this.ws) return;
-        this.ws = null;
-        this.authenticated = false;
-        this.stopHeartbeat();
-        const reason = event.reason || 'closed';
-        log('warn', `Signaling: closed (code ${event.code}: ${reason})`);
-        this.onClose(event.code, reason);
-
-        if (event.code === CLOSE.UNAUTHORIZED) {
-          this.onAuthFailed(reason);
-          return;
-        }
-        if (event.code === CLOSE.REPLACED) {
-          this.stopped = true;
-          this.onReplaced(reason);
-          return;
-        }
-        if (event.code === CLOSE.TOO_MANY_VIEWERS) {
-          this.onViewerLimit(reason);
-          if (!this.stopped) this.scheduleReconnect(30000);
-          return;
-        }
-        if (!this.stopped) this.scheduleReconnect();
-      };
-    }
-
-    /** @returns {boolean} */
-    send(data) {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        log('warn', `Signaling: cannot send '${data && data.type}' (socket not open)`);
-        return false;
-      }
-      try {
-        this.ws.send(JSON.stringify(data));
-        return true;
-      } catch (err) {
-        log('error', `Signaling: send failed: ${err.message}`);
-        return false;
-      }
-    }
-
-    startHeartbeat() {
-      this.stopHeartbeat();
-      // Ping every 10 s (server drops silent clients after 30 s). If no pong
-      // comes back for 25 s the TCP connection is dead (e.g. Wi-Fi -> 5G
-      // switch): close it ourselves so the reconnect happens now, not minutes later.
-      this.heartbeatTimer = setInterval(() => {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        if (Date.now() - this.lastPong > 25000) {
-          log('warn', 'Signaling: no pong for 25 s, forcing reconnect');
-          try {
-            this.ws.close(4000, 'pong timeout');
-          } catch (_) {
-            /* ignore */
-          }
-          return;
-        }
-        this.send({ type: 'ping' });
-      }, 10000);
-    }
-
-    stopHeartbeat() {
-      if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
-
-    scheduleReconnect(minDelayMs) {
-      if (this.reconnectTimer || this.stopped) return;
-      this.reconnectAttempts += 1;
-      // 1 s, 2 s, 4 s ... capped at 30 s, plus jitter so devices do not stampede.
-      let delay = Math.min(30000, 1000 * Math.pow(2, this.reconnectAttempts - 1)) + Math.random() * 500;
-      if (minDelayMs) delay = Math.max(delay, minDelayMs);
-      log('info', `Signaling: reconnect in ${(delay / 1000).toFixed(1)} s (attempt ${this.reconnectAttempts})`);
-      this.reconnectTimer = setTimeout(() => {
-        this.reconnectTimer = null;
-        this.connect();
-      }, delay);
-    }
-
-    /** Reconnect right now (network came back, user tapped Reconnect). */
-    reconnectNow() {
-      this.reconnectAttempts = 0;
-      this.connect();
-    }
-
-    clearReconnectTimer() {
-      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-
-    disposeSocket() {
-      const old = this.ws;
-      this.ws = null;
-      this.authenticated = false;
-      this.stopHeartbeat();
-      if (old) {
-        old.onopen = old.onmessage = old.onerror = old.onclose = null;
-        try {
-          old.close(1000, 'superseded');
-        } catch (_) {
-          /* ignore */
-        }
-      }
-    }
-
-    close() {
-      this.stopped = true;
-      this.clearReconnectTimer();
-      this.disposeSocket();
-    }
-  }
-
-  // ---------------------------------------------------------------- stats
+  const TOKEN_MESSAGES = {
+    wrong_key: 'The server rejected this key. Scan the QR code again (the server owner can print it with show-pairing.sh) or ask the server owner for the key.',
+    too_many_viewers: 'Too many people are watching right now. Try again in a moment.',
+    bad_request: 'The app sent a request the server did not understand. Reload the page.',
+    network: 'Could not reach the Petcam server. Check your internet connection and try again.',
+    server: 'The Petcam server had a problem. Try again in a moment.',
+  };
 
   /**
-   * @param {RTCPeerConnection | null} pc
-   * @param {'inbound' | 'outbound'} direction
-   * @returns {Promise<{width: number, height: number, fps: number, frames: number, bytes: number}>}
+   * Ask the control plane for a LiveKit token.
+   * @param {'camera' | 'viewer'} role
+   * @param {string} key
+   * @param {string} deviceId
+   * @returns {Promise<{url: string, token: string, room: string, identity: string, ttl_seconds: number}>}
    */
-  async function readVideoStats(pc, direction) {
-    const result = { width: 0, height: 0, fps: 0, frames: 0, bytes: 0 };
-    if (!pc || pc.connectionState === 'closed') return result;
+  async function requestToken(role, key, deviceId) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    let res;
     try {
-      const stats = await pc.getStats();
-      stats.forEach((report) => {
-        if (report.kind !== 'video' && report.mediaType !== 'video') return;
-        if (direction === 'inbound' && report.type === 'inbound-rtp') {
-          result.width = report.frameWidth || 0;
-          result.height = report.frameHeight || 0;
-          result.fps = report.framesPerSecond ? Math.round(report.framesPerSecond) : 0;
-          result.frames = report.framesDecoded || 0;
-          result.bytes = report.bytesReceived || 0;
-        } else if (direction === 'outbound' && report.type === 'outbound-rtp') {
-          result.width = report.frameWidth || 0;
-          result.height = report.frameHeight || 0;
-          result.fps = report.framesPerSecond ? Math.round(report.framesPerSecond) : 0;
-          result.frames = report.framesEncoded || 0;
-          result.bytes = report.bytesSent || 0;
-        }
+      res = await fetch('/api/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role, key, device_id: deviceId }),
+        cache: 'no-store',
+        signal: controller.signal,
       });
-    } catch (_) {
-      /* connection closed mid-call */
+    } catch (err) {
+      clearTimeout(timer);
+      throw tokenError('network', err && err.message);
     }
-    return result;
+    clearTimeout(timer);
+
+    let body = null;
+    try {
+      body = await res.json();
+    } catch (_) {
+      body = null;
+    }
+    if (res.ok && body && body.token && body.url) {
+      log('info', `Token issued for ${role} as ${body.identity} (room ${body.room})`);
+      return body;
+    }
+    const code = (body && body.error) || (res.status === 401 ? 'wrong_key' : res.status === 409 ? 'too_many_viewers' : res.status === 400 ? 'bad_request' : 'server');
+    throw tokenError(code, `HTTP ${res.status}`);
   }
 
-  /** "host 100.1.2.3 -> prflx 100.4.5.6" for the active ICE pair, or null. */
-  async function describeSelectedPair(pc) {
-    if (!pc || pc.connectionState === 'closed') return null;
-    try {
-      const stats = await pc.getStats();
-      let pair = null;
-      stats.forEach((r) => {
-        if (r.type === 'transport' && r.selectedCandidatePairId) pair = stats.get(r.selectedCandidatePairId);
-      });
-      if (!pair) {
-        stats.forEach((r) => {
-          if (r.type === 'candidate-pair' && (r.selected || r.nominated) && r.state === 'succeeded') pair = r;
-        });
-      }
-      if (!pair) return null;
-      const local = stats.get(pair.localCandidateId);
-      const remote = stats.get(pair.remoteCandidateId);
-      const fmt = (c) => (c ? `${c.candidateType || '?'} ${c.address || c.ip || '?'}:${c.port || '?'}` : '?');
-      return `${fmt(local)} -> ${fmt(remote)}`;
-    } catch (_) {
-      return null;
-    }
+  function tokenError(code, detail) {
+    const err = new Error(TOKEN_MESSAGES[code] || TOKEN_MESSAGES.server);
+    err.code = code;
+    err.detail = detail || '';
+    return err;
   }
 
-  Petcam.CLOSE = CLOSE;
+  // -------------------------------------------------------------- helpers
+
+  /** Plain-English text for a getUserMedia / LiveKit media error. */
+  function friendlyMediaError(err) {
+    if (!err) return 'Unknown camera error.';
+    const name = err.name || '';
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      return 'Camera permission was denied. Reload the page and tap Allow when the browser asks.';
+    }
+    if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+      return 'No usable camera was found. Try the other lens.';
+    }
+    if (name === 'NotReadableError' || name === 'AbortError') {
+      return 'Another app is using the camera. Close it and try again.';
+    }
+    return `Camera error: ${name ? name + ': ' : ''}${err.message || String(err)}`;
+  }
+
+  function formatBitrate(bitsPerSecond) {
+    if (!bitsPerSecond || bitsPerSecond <= 0) return '–';
+    if (bitsPerSecond >= 1_000_000) return (bitsPerSecond / 1_000_000).toFixed(1) + ' Mbps';
+    return Math.round(bitsPerSecond / 1000) + ' kbps';
+  }
+
   Petcam.log = log;
   Petcam.initDiagnosticsUI = initDiagnosticsUI;
   Petcam.takeKeyFromFragment = takeKeyFromFragment;
@@ -462,12 +218,14 @@
   Petcam.storeKey = storeKey;
   Petcam.getDeviceId = getDeviceId;
   Petcam.randomId = randomId;
-  Petcam.loadIceServers = loadIceServers;
-  Petcam.rtcConfig = rtcConfig;
-  Petcam.describeCandidate = describeCandidate;
-  Petcam.SignalingClient = SignalingClient;
-  Petcam.readVideoStats = readVideoStats;
-  Petcam.describeSelectedPair = describeSelectedPair;
+  Petcam.requestToken = requestToken;
+  Petcam.friendlyMediaError = friendlyMediaError;
+  Petcam.formatBitrate = formatBitrate;
+  Petcam.LK = window.LivekitClient || null;
+
+  if (!Petcam.LK) {
+    log('error', 'LiveKit client did not load (static/js/vendor/livekit-client.umd.js)');
+  }
 
   document.addEventListener('DOMContentLoaded', initDiagnosticsUI);
 })();

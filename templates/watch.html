@@ -28,13 +28,19 @@
 
       <main class="main-stage">
         <div class="video-container" id="video-wrapper">
-          <!-- muted at first: Chrome and Safari block unmuted autoplay. The Unmute button is the user gesture. -->
+          <!--
+            muted + playsinline + autoplay: Chrome and Safari only autoplay video that is muted.
+            This element carries the picture only. The sound plays through a hidden <audio>
+            element that watch.js creates, so tapping Unmute never touches this element and
+            cannot make Chrome pause the picture (it pauses a muted-autoplay video that is
+            unmuted without a tap).
+          -->
           <video id="remote-video" class="video-element" autoplay playsinline muted webkit-playsinline></video>
 
           <div id="offline-banner" class="center-banner hidden">
             <div class="center-banner-icon">📹</div>
             <h2 class="center-banner-title">Camera is offline</h2>
-            <p class="center-banner-desc">Waiting for the iPad to connect. This page reconnects by itself.</p>
+            <p class="center-banner-desc">Waiting for the camera to connect. This page reconnects by itself.</p>
           </div>
 
           <div id="play-overlay" class="center-banner tappable hidden">
@@ -45,7 +51,7 @@
 
           <div id="key-card" class="overlay-card hidden">
             <h2 class="card-heading">Viewer key</h2>
-            <p class="card-subtext">Scan the phone QR code from the pairing page, or paste the viewer key from config.toml.</p>
+            <p class="card-subtext">Scan the phone QR code again (the server owner prints it with <code>show-pairing.sh</code>, or tap Share QR on a phone that is already paired), or paste the viewer key here. Safari forgets the key after a week without use unless the page is added to the Home Screen.</p>
             <div class="form-row">
               <input type="password" id="key-input" class="input-text" placeholder="Viewer key (32+ characters)" autocomplete="off" spellcheck="false" />
               <button id="save-key-btn" class="btn btn-primary">Connect</button>
@@ -55,9 +61,20 @@
         </div>
       </main>
 
+      <!-- Short plain-English notices (microphone blocked, viewer limit, ...). Hidden when empty. -->
+      <div id="notice-banner" class="notice-banner hidden" role="status" aria-live="polite"></div>
+
       <div class="controls-bar">
         <button id="audio-toggle-btn" class="btn btn-control" aria-label="Unmute audio">
           <span id="audio-icon">🔇</span><span id="audio-text">Unmute</span>
+        </button>
+        <!--
+          Push-to-talk: hold to send this device's microphone to the camera. Pointer, touch and
+          keyboard (Space) handlers live in watch.js; touch-action/callout are disabled in CSS so
+          a long press does not scroll the page or open the copy menu on phones.
+        -->
+        <button id="talk-btn" class="btn btn-control btn-talk" aria-label="Hold to talk" aria-pressed="false" title="Hold to talk (or hold Space)" disabled>
+          <span id="talk-icon">🎙️</span><span id="talk-text">Hold to talk</span>
         </button>
         <button id="quality-toggle-btn" class="btn btn-control" aria-label="Toggle stream quality">
           <span class="control-tag">Quality</span><strong id="quality-mode-text">Auto</strong>
@@ -69,7 +86,7 @@
 
       <footer id="status-strip" class="status-strip" title="Long press for the diagnostic log">
         <div class="status-col"><span class="label">State</span> <strong id="conn-state" class="val val-connecting">Connecting</strong></div>
-        <div class="status-col"><span class="label">ICE</span> <span id="ice-state" class="val val-sub">new</span></div>
+        <div class="status-col"><span class="label">Link</span> <span id="ice-state" class="val val-sub">closed</span></div>
         <div class="status-col"><span class="label">Feed</span> <span id="feed-stats" class="val val-sub">–</span></div>
       </footer>
     </div>
@@ -91,13 +108,15 @@
           <button id="close-qr-btn" class="btn btn-secondary btn-sm">Close</button>
         </div>
         <div class="qr-modal-body">
-          <p class="qr-instructions">Scan this with the other phone's camera. It must be signed in to the same Tailscale account.</p>
+          <p class="qr-instructions">Scan this with the other phone's camera. It opens the viewer page with the key already filled in.</p>
           <div id="qr-code-display" class="qr-code-display"></div>
           <p id="qr-link-copy" class="qr-link-copy"></p>
         </div>
       </div>
     </div>
 
+    <!-- The LiveKit browser SDK is served from this origin (CSP script-src 'self'); it must load before common.js. -->
+    <script src="/static/js/vendor/livekit-client.umd.js"></script>
     <script src="/static/js/common.js"></script>
     <script src="/static/js/watch.js"></script>
   </body>

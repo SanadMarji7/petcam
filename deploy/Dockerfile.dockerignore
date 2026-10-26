@@ -1,0 +1,17 @@
+# Applies to builds that use deploy/Dockerfile (BuildKit reads
+# <Dockerfile>.dockerignore in preference to <context>/.dockerignore).
+# The build context is the repository root.
+venv/
+.venv/
+.git/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+config.toml
+pairing.html
+deploy/caddy_data/
+deploy/petcam.env
+tests/
+docs/
+*.md

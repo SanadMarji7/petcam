@@ -11,7 +11,7 @@
     <link rel="stylesheet" href="/static/css/styles.css" />
   </head>
   <body class="role-cam">
-    <!-- Pure black overlay. The camera, wake lock and peer connections keep running under it. -->
+    <!-- Pure black overlay. The camera, wake lock and the LiveKit connection keep running under it. -->
     <div id="screen-off-overlay" class="screen-off-overlay hidden" aria-hidden="true"></div>
 
     <div class="app-container">
@@ -34,7 +34,7 @@
           <div id="setup-card" class="overlay-card">
             <div id="key-section" class="setup-group">
               <h2 class="card-heading">Camera key</h2>
-              <p class="card-subtext">Scan the iPad QR code from the pairing page, or paste the publisher key from config.toml.</p>
+              <p class="card-subtext">Scan the iPad QR code again (the server owner prints it with <code>show-pairing.sh</code> or <code>setup.py</code>), or paste the camera key here. Safari forgets the key after a week without use unless the page is added to the Home Screen.</p>
               <div class="form-row">
                 <input type="password" id="key-input" class="input-text" placeholder="Publisher key (32+ characters)" autocomplete="off" spellcheck="false" />
                 <button id="save-key-btn" class="btn btn-primary">Save key</button>
@@ -58,17 +58,12 @@
               <button id="start-cam-btn" class="btn btn-primary btn-large">Start camera</button>
             </div>
           </div>
-
-          <div id="replaced-card" class="overlay-card hidden">
-            <h2 class="card-heading">Another camera page took over</h2>
-            <p class="card-subtext">A second /cam page connected, so this one stopped streaming. Close the other page, then resume here.</p>
-            <button id="resume-btn" class="btn btn-primary btn-large">Stream from this device</button>
-          </div>
         </div>
       </main>
 
-      <footer id="publisher-footer" class="status-strip hidden" title="Long press for the diagnostic log">
-        <div class="status-col"><span class="label">Status</span> <strong id="stream-status" class="val val-connecting">Starting</strong></div>
+      <!-- Always visible: a long press opens the diagnostic log, which matters most when starting fails. -->
+      <footer id="publisher-footer" class="status-strip" title="Long press for the diagnostic log">
+        <div class="status-col"><span class="label">Status</span> <strong id="stream-status" class="val val-connecting">Not started</strong></div>
         <div class="status-col"><span class="label">Viewers</span> <strong id="viewer-count" class="val">0</strong></div>
         <div class="status-col"><span class="label">Video</span> <strong id="stat-resolution" class="val">–</strong></div>
         <div class="status-col"><span class="label">Uptime</span> <strong id="stat-uptime" class="val">00:00:00</strong></div>
@@ -85,6 +80,8 @@
       </div>
     </div>
 
+    <!-- LiveKit browser SDK, vendored so CSP can stay script-src 'self'. Must load before common.js. -->
+    <script src="/static/js/vendor/livekit-client.umd.js"></script>
     <script src="/static/js/common.js"></script>
     <script src="/static/js/cam.js"></script>
   </body>

@@ -6,7 +6,7 @@ import qrcode
 
 from qrgen import QUIET_ZONE_MODULES, matrix_to_svg, matrix_to_terminal, qr_matrix, qr_svg
 
-URL = "https://dogcam.tail1234.ts.net/watch#key=" + "k" * 43
+URL = "https://app.example.com/watch#key=" + "k" * 43
 
 
 def test_matrix_is_square_with_quiet_zone() -> None:

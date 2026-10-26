@@ -1,0 +1,3 @@
+# Secrets and runtime state. Never commit these.
+petcam.env
+caddy_data/

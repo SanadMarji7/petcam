@@ -1,0 +1,120 @@
+# Caddy configuration for Petcam (JSON config written as YAML; the container is
+# started with `--adapter yaml`). Replace <domain> with your domain, or run
+# ./configure.sh <domain> which does it for you.
+#
+# Why Caddy with the layer4 plugin: browsers on mobile data and office networks
+# often reach only ports 80 and 443. LiveKit's WebSocket signaling, the TURN
+# relay and the Petcam pages therefore all share port 443. Caddy looks at the
+# server name (SNI) in each incoming TLS handshake: connections for lk.<domain>
+# and turn.<domain> are handed to LiveKit as raw TLS streams (the "layer4"
+# listener wrapper below), everything else reaches Caddy's ordinary HTTP server,
+# which serves app.<domain> as a normal reverse proxy. That way the Petcam
+# control plane receives X-Forwarded-For with the real client address, request
+# bodies are capped before they reach it, and plain http:// links are
+# redirected to https://. Certificates come from Let's Encrypt automatically
+# via the HTTP challenge on port 80, so port 80 must be open.
+#
+# Shape taken from LiveKit's generator (https://docs.livekit.io/home/self-hosting/vm/)
+# plus the listener-wrapper form documented by the caddy-l4 plugin.
+
+logging:
+  logs:
+    default:
+      level: INFO
+
+storage:
+  module: file_system
+  root: /data
+
+apps:
+  tls:
+    certificates:
+      automate:
+        - app.<domain>
+        - lk.<domain>
+        - turn.<domain>
+
+  http:
+    servers:
+      # Port 80: Let's Encrypt's HTTP challenge is answered here automatically
+      # (Caddy checks for it before any route); every other request is sent to
+      # the https:// address, so a typed or old http:// link still works.
+      insecure:
+        listen:
+          - ":80"
+        routes:
+          - handle:
+              - handler: static_response
+                status_code: 308
+                headers:
+                  Location:
+                    - "https://{http.request.host}{http.request.uri}"
+
+      secure:
+        listen:
+          - ":443"
+        automatic_https:
+          disable_redirects: true   # the insecure server above does the redirect
+        listener_wrappers:
+          # The layer4 wrapper sees every new connection first. A connection
+          # whose SNI matches a route below is consumed by that route and never
+          # reaches the HTTP server; the rest (app.<domain>) fall through to the
+          # tls wrapper and are handled as HTTPS by the routes further down.
+          - wrapper: layer4
+            routes:
+              # TURN over TLS. Caddy terminates TLS and passes the plain TURN
+              # stream to LiveKit's TURN listener (turn.tls_port in livekit.yaml,
+              # with external_tls: true so LiveKit does not expect its own cert).
+              - match:
+                  - tls:
+                      sni:
+                        - "turn.<domain>"
+                handle:
+                  - handler: tls
+                  - handler: proxy
+                    upstreams:
+                      - dial:
+                          - "localhost:5349"
+
+              # LiveKit signaling (WSS) and its HTTP API. ALPN is pinned to
+              # HTTP/1.1 because the upstream speaks plain HTTP/1.1; if a browser
+              # negotiated HTTP/2 here, LiveKit would receive h2 frames it cannot
+              # parse.
+              - match:
+                  - tls:
+                      sni:
+                        - "lk.<domain>"
+                handle:
+                  - handler: tls
+                    connection_policies:
+                      - alpn:
+                          - "http/1.1"
+                  - handler: proxy
+                    upstreams:
+                      - dial:
+                          - "localhost:7880"
+          - wrapper: tls
+
+        routes:
+          # Petcam control plane (the /cam and /watch pages, token minting).
+          - match:
+              - host:
+                  - "app.<domain>"
+            handle:
+              # Nothing the pages send is bigger than a few hundred bytes; cap
+              # bodies here so an oversized upload is dropped before uvicorn.
+              - handler: request_body
+                max_size: 65536
+              - handler: reverse_proxy
+                headers:
+                  request:
+                    set:
+                      # Exactly the TCP peer address, never a value a client
+                      # sent itself. uvicorn turns it into request.client.host.
+                      X-Forwarded-For:
+                        - "{http.request.remote.host}"
+                      X-Forwarded-Proto:
+                        - "https"
+                upstreams:
+                  - dial: "localhost:8000"
+            terminal: true

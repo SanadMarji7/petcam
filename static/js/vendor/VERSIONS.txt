@@ -1,0 +1,1 @@
+livekit-client 2.23.0 (UMD build of https://www.npmjs.com/package/livekit-client, Apache-2.0)

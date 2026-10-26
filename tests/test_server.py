@@ -1,96 +1,359 @@
-"""HTTP and WebSocket behaviour of the FastAPI app, driven through TestClient."""
+"""HTTP behaviour of the FastAPI control plane, driven through TestClient.
+
+No test talks to a LiveKit server: `main.list_room_participants` and
+`main.ensure_room` are replaced by a fake backed by a plain list, so the suite
+passes with the container down.
+"""
 from __future__ import annotations
 
-from contextlib import ExitStack
+import re
+import time
 
 import pytest
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from livekit import api
 
 import main
 from config import Settings
-from hub import CLOSE_MALFORMED, CLOSE_REPLACED, CLOSE_TIMEOUT, CLOSE_TOO_MANY_VIEWERS, CLOSE_UNAUTHORIZED
-from main import create_app, is_local_request, origin_allowed, parse_message, sanitize_device_id
+from main import create_app, identity_for, parse_token_request, sanitize_device_id
 
-ORIGIN = {"origin": "https://dogcam.test.ts.net"}
+
+class FakeRoom:
+    """Stand-in for the LiveKit RoomService: a list of participants or an outage."""
+
+    def __init__(self) -> None:
+        self.participants: list[api.ParticipantInfo] = []
+        self.unreachable = False
+        self.create_calls: list[int] = []  # max_participants of every create_room call
+
+    def add(self, identity: str, state: int = api.ParticipantInfo.State.ACTIVE) -> None:
+        self.participants.append(api.ParticipantInfo(identity=identity, state=state))
+
+    async def list_participants(self, settings: Settings) -> list[api.ParticipantInfo]:
+        if self.unreachable:
+            raise ConnectionError("Cannot connect to host 127.0.0.1:7880")
+        return list(self.participants)
+
+    async def ensure_room(self, settings: Settings) -> None:
+        if self.unreachable:
+            raise ConnectionError("Cannot connect to host 127.0.0.1:7880")
+        self.create_calls.append(settings.max_viewers + 1)
 
 
 @pytest.fixture
-def client(settings: Settings):
+def room(monkeypatch: pytest.MonkeyPatch) -> FakeRoom:
+    fake = FakeRoom()
+    monkeypatch.setattr(main, "list_room_participants", fake.list_participants)
+    monkeypatch.setattr(main, "ensure_room", fake.ensure_room)
+    return fake
+
+
+@pytest.fixture
+def client(settings: Settings, room: FakeRoom):
     with TestClient(create_app(settings)) as c:
         yield c
 
 
 @pytest.fixture
-def local_client(settings: Settings):
+def local_client(settings: Settings, room: FakeRoom):
+    """A client whose requests appear to come from the server's own loopback address."""
     with TestClient(create_app(settings), client=("127.0.0.1", 40000)) as c:
         yield c
 
 
-@pytest.fixture
-def sockets():
-    """Every WebSocket session opened through connect() is closed at test end."""
-    with ExitStack() as stack:
-        yield stack
+def forget_recent_viewers(client: TestClient) -> None:
+    """Pretend the join grace period for every recently minted viewer token has passed."""
+    recent = client.app.state.recent_viewers
+    for identity in list(recent):
+        recent[identity] = time.monotonic() - 1
 
 
-def connect(stack: ExitStack, client: TestClient, role: str, key: str, device_id: str | None = None):
-    ws = stack.enter_context(client.websocket_connect(f"/ws/{role}", headers=ORIGIN))
-    auth = {"type": "auth", "key": key}
-    if device_id:
-        auth["device_id"] = device_id
-    ws.send_json(auth)
-    return ws
+def token(client: TestClient, role: str, key: str, device_id: str | None = "dev1", **extra):
+    body = {"role": role, "key": key, **extra}
+    if device_id is not None:
+        body["device_id"] = device_id
+    return client.post("/api/token", json=body)
 
 
-def close_code(ws) -> int:
-    with pytest.raises(WebSocketDisconnect) as info:
-        ws.receive_json()
-    return info.value.code
+def decode(settings: Settings, jwt: str) -> api.Claims:
+    return api.TokenVerifier(settings.livekit_api_key, settings.livekit_api_secret).verify(jwt)
 
 
-# ------------------------------------------------------------------ http
+# ------------------------------------------------------------------ pages
 
 
-def test_pages_and_headers(client: TestClient) -> None:
+def test_pages_and_headers(client: TestClient, settings: Settings) -> None:
     assert client.get("/", follow_redirects=False).headers["location"] == "/watch"
     for path in ("/cam", "/watch"):
         res = client.get(path)
         assert res.status_code == 200
         assert "/static/js/common.js" in res.text
         assert res.headers["Cache-Control"] == "no-store"
-        assert "frame-ancestors 'none'" in res.headers["Content-Security-Policy"]
-        assert "'unsafe-inline'" not in res.headers["Content-Security-Policy"].split("style-src")[0]
+        csp = res.headers["Content-Security-Policy"]
+        assert "frame-ancestors 'none'" in csp
+        assert "script-src 'self';" in csp
+        assert "connect-src 'self' ws://127.0.0.1:7880 http://127.0.0.1:7880;" in csp
+        assert "media-src 'self' blob: mediastream:" in csp
+        assert "worker-src 'self' blob:" in csp
+        assert "'unsafe-inline'" not in csp.split("style-src")[0]
     assert client.get("/docs").status_code == 404
-    assert client.get("/static/js/watch.js").status_code == 200
+    assert client.get("/config.json").status_code == 404
+    assert client.get("/static/js/common.js").status_code == 200
+    assert client.get("/static/js/vendor/livekit-client.umd.js").status_code == 200
 
 
-def test_health_and_config(client: TestClient, settings: Settings) -> None:
-    assert client.get("/healthz").json() == {"publisher": False, "viewers": 0, "max_viewers": settings.max_viewers}
-    assert client.get("/config.json").json() == {"stun_enabled": False, "ice_servers": []}
+def test_csp_names_the_production_livekit_host(settings: Settings, room: FakeRoom) -> None:
+    prod = Settings(**{**settings.__dict__, "livekit_url": "wss://lk.example.com"})
+    with TestClient(create_app(prod)) as c:
+        csp = c.get("/watch").headers["Content-Security-Policy"]
+    assert "connect-src 'self' wss://lk.example.com https://lk.example.com;" in csp
 
 
-def test_config_json_with_stun(settings: Settings) -> None:
-    with TestClient(create_app(Settings(**{**settings.__dict__, "stun_enabled": True}))) as c:
-        data = c.get("/config.json").json()
-        assert data["stun_enabled"] is True
-        assert data["ice_servers"][0]["urls"].startswith("stun:")
+# ------------------------------------------------------------------ tokens
 
 
-def test_setup_page_only_for_local_requests(client: TestClient, local_client: TestClient, settings: Settings) -> None:
+def test_camera_token(client: TestClient, settings: Settings) -> None:
+    res = token(client, "camera", settings.publisher_key, device_id="ipad-1")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["url"] == settings.livekit_url
+    assert data["room"] == settings.room_name
+    assert data["identity"] == "cam-ipad-1"
+    assert data["ttl_seconds"] == 3600
+
+    claims = decode(settings, data["token"])
+    assert claims.identity == "cam-ipad-1"
+    assert claims.name == "camera"
+    grants = claims.video
+    assert grants.room_join is True
+    assert grants.room == settings.room_name
+    assert grants.can_publish is True
+    assert grants.can_subscribe is True
+    assert grants.can_publish_data is True
+    assert not grants.can_publish_sources
+    assert not grants.room_admin
+
+
+def test_viewer_token(client: TestClient, settings: Settings) -> None:
+    res = token(client, "viewer", settings.viewer_key, device_id="pixel")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["identity"] == "viewer-pixel"
+    claims = decode(settings, data["token"])
+    assert claims.identity == "viewer-pixel"
+    assert claims.name == "viewer"
+    grants = claims.video
+    assert grants.room_join is True
+    assert grants.room == settings.room_name
+    assert grants.can_publish is True
+    assert grants.can_subscribe is True
+    assert grants.can_publish_data is True
+    assert grants.can_publish_sources == ["microphone"]
+
+
+def test_token_ttl_is_one_hour(client: TestClient, settings: Settings) -> None:
+    import base64
+    import json
+    import time
+
+    jwt = token(client, "camera", settings.publisher_key).json()["token"]
+    payload = jwt.split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    assert claims["iss"] == settings.livekit_api_key
+    assert 3590 <= claims["exp"] - time.time() <= 3600
+    assert claims["exp"] - claims["nbf"] == 3600
+
+
+def test_wrong_key(client: TestClient, settings: Settings) -> None:
+    assert token(client, "camera", settings.viewer_key).status_code == 401
+    assert token(client, "viewer", settings.publisher_key).status_code == 401
+    res = token(client, "viewer", "nope")
+    assert res.status_code == 401
+    assert res.json() == {"error": "wrong_key"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"not json",
+        b"[]",
+        b'{"role": "publisher", "key": "x"}',
+        b'{"role": "camera"}',
+        b'{"role": "camera", "key": 5}',
+        b'{"role": "camera", "key": ""}',
+        b'{"role": "camera", "key": "x", "device_id": 7}',
+    ],
+)
+def test_bad_body(client: TestClient, body: bytes) -> None:
+    res = client.post("/api/token", content=body, headers={"content-type": "application/json"})
+    assert res.status_code == 400
+    assert res.json() == {"error": "bad_request"}
+
+
+def test_oversized_body_is_refused_before_it_is_read(client: TestClient, settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    valid = b'{"role": "camera", "key": "%s", "device_id": "ipad"}' % settings.publisher_key.encode()
+    padding = b" " * (main.MAX_BODY_BYTES + 1 - len(valid))
+
+    # Content-Length says it all: nothing is read.
+    streamed = []
+
+    async def spy_stream(self):  # pragma: no cover - only runs if the guard is broken
+        streamed.append(True)
+        yield b""
+
+    monkeypatch.setattr("starlette.requests.Request.stream", spy_stream)
+    res = client.post("/api/token", content=valid + padding, headers={"content-type": "application/json"})
+    assert res.status_code == 413
+    assert res.json() == {"error": "bad_request"}
+    assert streamed == []
+    monkeypatch.undo()
+
+    # No Content-Length (chunked): the stream is cut off at the limit.
+    res = client.post("/api/token", content=iter([valid, padding]), headers={"content-type": "application/json"})
+    assert res.status_code == 413
+
+    # Exactly at the limit, the body is still parsed.
+    res = client.post("/api/token", content=valid + padding[:-1], headers={"content-type": "application/json"})
+    assert res.status_code == 200
+
+
+def test_identity_sanitization(client: TestClient, settings: Settings) -> None:
+    assert token(client, "camera", settings.publisher_key, device_id=" iPad Pro <script> ").json()["identity"] == "cam-iPadProscript"
+    long = token(client, "viewer", settings.viewer_key, device_id="x" * 200).json()["identity"]
+    assert long == "viewer-" + "x" * 64
+    for empty in ("", "   ", "!!!", None):
+        identity = token(client, "camera", settings.publisher_key, device_id=empty).json()["identity"]
+        assert re.fullmatch(r"cam-[0-9a-f]{8}", identity), identity
+
+
+def test_viewer_limit(client: TestClient, settings: Settings, room: FakeRoom) -> None:
+    room.add("cam-ipad")
+    room.add("viewer-a")
+    assert token(client, "viewer", settings.viewer_key, device_id="b").status_code == 200
+    room.add("viewer-b")
+
+    res = token(client, "viewer", settings.viewer_key, device_id="c")
+    assert res.status_code == 409
+    assert res.json() == {"error": "too_many_viewers"}
+    # The same device reconnecting (reload, Wi-Fi to 5G) is not counted against itself.
+    assert token(client, "viewer", settings.viewer_key, device_id="b").status_code == 200
+    # A viewer that LiveKit already marked as gone does not take a seat, once
+    # the grace period for the token it was just given is over.
+    room.participants.pop()
+    room.add("viewer-b", state=api.ParticipantInfo.State.DISCONNECTED)
+    assert token(client, "viewer", settings.viewer_key, device_id="c").status_code == 409
+    forget_recent_viewers(client)
+    assert token(client, "viewer", settings.viewer_key, device_id="c").status_code == 200
+    # The camera is never subject to the viewer limit.
+    room.add("viewer-c")
+    room.add("viewer-d")
+    assert token(client, "camera", settings.publisher_key, device_id="ipad").status_code == 200
+
+
+def test_viewer_limit_counts_tokens_minted_moments_ago(client: TestClient, settings: Settings, room: FakeRoom) -> None:
+    """Two phones asking at the same instant cannot both get the last seat."""
+    room.add("cam-ipad")
+    assert token(client, "viewer", settings.viewer_key, device_id="a").status_code == 200
+    assert token(client, "viewer", settings.viewer_key, device_id="b").status_code == 200
+    # Neither has joined yet as far as LiveKit knows, but both seats are spoken for.
+    assert token(client, "viewer", settings.viewer_key, device_id="c").status_code == 409
+    # Asking again from the same device is fine.
+    assert token(client, "viewer", settings.viewer_key, device_id="a").status_code == 200
+    # Once the grace period has passed and they never joined, the seats are free again.
+    forget_recent_viewers(client)
+    assert token(client, "viewer", settings.viewer_key, device_id="c").status_code == 200
+    assert set(client.app.state.recent_viewers) == {"viewer-c"}
+
+
+def test_viewer_limit_skipped_when_livekit_unreachable(client: TestClient, settings: Settings, room: FakeRoom) -> None:
+    room.add("viewer-a")
+    room.add("viewer-b")
+    room.unreachable = True
+    assert token(client, "viewer", settings.viewer_key, device_id="c").status_code == 200
+
+
+def test_room_is_created_with_a_participant_cap(client: TestClient, settings: Settings, room: FakeRoom) -> None:
+    """Every token request pins the room's max_participants to camera + max_viewers in LiveKit itself."""
+    assert token(client, "camera", settings.publisher_key, device_id="ipad").status_code == 200
+    assert token(client, "viewer", settings.viewer_key, device_id="a").status_code == 200
+    assert room.create_calls == [settings.max_viewers + 1] * 2
+    # A wrong key never touches LiveKit.
+    assert token(client, "viewer", settings.publisher_key, device_id="a").status_code == 401
+    assert len(room.create_calls) == 2
+
+
+# ------------------------------------------------------------------ health
+
+
+def test_healthz(client: TestClient, settings: Settings, room: FakeRoom) -> None:
+    assert client.get("/healthz").json() == {
+        "livekit": True, "camera": False, "viewers": 0, "max_viewers": 2, "room": settings.room_name,
+    }
+    room.add("cam-ipad")
+    room.add("viewer-a")
+    room.add("viewer-b", state=api.ParticipantInfo.State.DISCONNECTED)
+    room.add("something-else")
+    assert client.get("/healthz").json() == {
+        "livekit": True, "camera": True, "viewers": 1, "max_viewers": 2, "room": settings.room_name,
+    }
+
+
+def test_healthz_when_livekit_unreachable(client: TestClient, settings: Settings, room: FakeRoom) -> None:
+    room.add("cam-ipad")
+    room.unreachable = True
+    res = client.get("/healthz")
+    assert res.status_code == 200
+    assert res.json() == {"livekit": False, "camera": False, "viewers": 0, "max_viewers": 2, "room": settings.room_name}
+
+
+def test_list_room_participants_handles_a_dead_server(settings: Settings) -> None:
+    """The real API helpers (not the fake) fail fast when nothing listens on the port."""
+    import asyncio
+
+    dead = Settings(**{**settings.__dict__, "livekit_url": "ws://127.0.0.1:1"})
+    with pytest.raises(Exception):
+        asyncio.run(main.list_room_participants(dead))
+    with pytest.raises(Exception):
+        asyncio.run(main.ensure_room(dead))
+
+
+# ------------------------------------------------------------- setup / qr
+
+
+def test_setup_page_requires_the_startup_token(client: TestClient, local_client: TestClient, settings: Settings) -> None:
     denied = client.get("/setup")
     assert denied.status_code == 403
     assert settings.publisher_key not in denied.text
+    assert settings.viewer_key not in denied.text
+    assert "show-pairing.sh" in denied.text
     assert "python3 setup.py" in denied.text
 
-    proxied = local_client.get("/setup", headers={"x-forwarded-for": "100.64.0.9"})
-    assert proxied.status_code == 403
+    # Looking local is not enough: behind a layer-4 proxy every request looks local.
+    assert local_client.get("/setup").status_code == 403
+    assert local_client.get("/setup", headers={"x-forwarded-for": "203.0.113.9"}).status_code == 403
+    assert settings.publisher_key not in local_client.get("/setup").text
 
-    allowed = local_client.get("/setup")
+    token_value = client.app.state.setup_token
+    assert len(token_value) >= 32
+    assert client.get("/setup", params={"token": token_value[:-1] + "x"}).status_code == 403
+    assert client.get("/setup", params={"token": ""}).status_code == 403
+
+    allowed = client.get("/setup", params={"token": token_value})
     assert allowed.status_code == 200
     assert settings.cam_pairing_url in allowed.text
     assert settings.watch_pairing_url in allowed.text
     assert allowed.text.count("<svg") == 2
+    assert "Tailscale" not in allowed.text
+    assert allowed.headers["Cache-Control"] == "no-store"
+
+
+def test_setup_token_is_fresh_per_process_and_logged(settings: Settings, room: FakeRoom, caplog: pytest.LogCaptureFixture) -> None:
+    first, second = create_app(settings), create_app(settings)
+    assert first.state.setup_token != second.state.setup_token
+    with caplog.at_level("INFO", logger="petcam"):
+        with TestClient(first):
+            pass
+    assert any(f"/setup?token={first.state.setup_token}" in r.getMessage() for r in caplog.records)
 
 
 def test_watch_qr_requires_viewer_key(client: TestClient, settings: Settings) -> None:
@@ -105,233 +368,13 @@ def test_watch_qr_requires_viewer_key(client: TestClient, settings: Settings) ->
 # -------------------------------------------------------------- helpers
 
 
-def test_origin_allowed() -> None:
-    assert origin_allowed(None, "dogcam.ts.net")
-    assert origin_allowed("https://dogcam.ts.net", "dogcam.ts.net")
-    assert origin_allowed("https://DOGCAM.ts.net:443", "dogcam.ts.net")
-    assert origin_allowed("http://localhost:8000", "dogcam.ts.net")
-    assert origin_allowed("http://127.0.0.1:8000", "dogcam.ts.net")
-    assert not origin_allowed("https://evil.example", "dogcam.ts.net")
-    assert not origin_allowed("https://dogcam.ts.net.evil.example", "dogcam.ts.net")
-
-
-def test_parse_message_and_device_id() -> None:
-    assert parse_message('{"type": "ping"}') == {"type": "ping"}
-    assert parse_message("not json") is None
-    assert parse_message('{"no": "type"}') is None
-    assert parse_message('{"type": 5}') is None
-    assert parse_message('{"type": "x", "pad": "' + "a" * 70000 + '"}') is None
+def test_helpers() -> None:
     assert sanitize_device_id(" dev_ab-12 <script> ") == "dev_ab-12script"
     assert sanitize_device_id(None) == ""
     assert len(sanitize_device_id("x" * 200)) == 64
+    assert identity_for("camera", "ipad") == "cam-ipad"
+    assert identity_for("viewer", "") .startswith("viewer-")
 
-
-class _Req:
-    def __init__(self, host: str, headers: dict[str, str]) -> None:
-        self.client = type("C", (), {"host": host})()
-        self.headers = headers
-
-
-def test_is_local_request() -> None:
-    assert is_local_request(_Req("127.0.0.1", {}))
-    assert not is_local_request(_Req("100.64.0.1", {}))
-    assert not is_local_request(_Req("127.0.0.1", {"x-forwarded-for": "100.64.0.1"}))
-    assert not is_local_request(_Req("127.0.0.1", {"x-forwarded-host": "dogcam.ts.net"}))
-
-
-# ------------------------------------------------------------ websockets
-
-
-def test_rejects_bad_origin(client: TestClient, settings: Settings) -> None:
-    with pytest.raises(WebSocketDisconnect) as info:
-        with client.websocket_connect("/ws/viewer", headers={"origin": "https://evil.example"}):
-            pass
-    assert info.value.code == 1008
-
-
-def test_auth_failures(client: TestClient, sockets: ExitStack, settings: Settings) -> None:
-    ws = connect(sockets, client, "viewer", "wrong-key")
-    assert close_code(ws) == CLOSE_UNAUTHORIZED
-
-    with client.websocket_connect("/ws/publisher", headers=ORIGIN) as ws:
-        ws.send_text("garbage")
-        assert close_code(ws) == CLOSE_MALFORMED
-
-    with client.websocket_connect("/ws/publisher", headers=ORIGIN) as ws:
-        ws.send_json({"type": "offer", "sdp": "x"})
-        assert close_code(ws) == CLOSE_MALFORMED
-
-    # The viewer key must not open the publisher socket.
-    ws = connect(sockets, client, "publisher", settings.viewer_key)
-    assert close_code(ws) == CLOSE_UNAUTHORIZED
-
-
-def test_auth_timeout(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(main, "AUTH_TIMEOUT_SECONDS", 0.2)
-    with TestClient(create_app(settings)) as c:
-        with c.websocket_connect("/ws/viewer", headers=ORIGIN) as ws:
-            assert close_code(ws) == CLOSE_TIMEOUT
-
-
-def test_full_signaling_exchange(client: TestClient, sockets: ExitStack, settings: Settings) -> None:
-    pub = connect(sockets, client, "publisher", settings.publisher_key, device_id="ipad")
-    assert pub.receive_json() == {"type": "auth_ok", "id": "ipad"}
-
-    viewer = connect(sockets, client, "viewer", settings.viewer_key, device_id="pixel")
-    assert viewer.receive_json() == {"type": "auth_ok", "id": "pixel"}
-    assert client.get("/healthz").json() == {"publisher": True, "viewers": 1, "max_viewers": 2}
-
-    viewer.send_json({"type": "join"})
-    assert viewer.receive_json() == {"type": "publisher_online"}
-    assert pub.receive_json() == {"type": "viewer_joined", "viewer_id": "pixel"}
-
-    pub.send_json({"type": "offer", "viewer_id": "pixel", "session": "s1", "restart": False, "sdp": "OFFER", "extra": "dropped"})
-    assert viewer.receive_json() == {"type": "offer", "session": "s1", "restart": False, "sdp": "OFFER"}
-
-    viewer.send_json({"type": "answer", "session": "s1", "sdp": "ANSWER"})
-    assert pub.receive_json() == {"type": "answer", "viewer_id": "pixel", "session": "s1", "sdp": "ANSWER"}
-
-    pub.send_json({"type": "ice", "viewer_id": "pixel", "session": "s1", "candidate": {"candidate": "c1"}})
-    assert viewer.receive_json() == {"type": "ice", "session": "s1", "candidate": {"candidate": "c1"}}
-    viewer.send_json({"type": "ice", "session": "s1", "candidate": {"candidate": "c2"}})
-    assert pub.receive_json() == {"type": "ice", "viewer_id": "pixel", "session": "s1", "candidate": {"candidate": "c2"}}
-
-    viewer.send_json({"type": "quality", "quality": "high"})
-    assert pub.receive_json() == {"type": "viewer_quality", "viewer_id": "pixel", "quality": "high"}
-    viewer.send_json({"type": "quality", "quality": "bogus"})
-    assert pub.receive_json() == {"type": "viewer_quality", "viewer_id": "pixel", "quality": "auto"}
-    viewer.send_json({"type": "restart"})
-    assert pub.receive_json() == {"type": "viewer_restart", "viewer_id": "pixel"}
-
-    viewer.send_json({"type": "ping"})
-    assert viewer.receive_json() == {"type": "pong"}
-    pub.send_json({"type": "ping"})
-    assert pub.receive_json() == {"type": "pong"}
-
-    # Dropped without crashing: unknown type, offer without sdp, offer to nobody.
-    pub.send_json({"type": "nonsense"})
-    pub.send_json({"type": "offer", "viewer_id": "pixel"})
-    pub.send_json({"type": "offer", "viewer_id": "ghost", "sdp": "x"})
-    pub.send_json({"type": "ping"})
-    assert pub.receive_json() == {"type": "pong"}
-
-    viewer.close()
-    assert pub.receive_json() == {"type": "viewer_left", "viewer_id": "pixel"}
-
-    pub.close()
-    assert client.get("/healthz").json()["publisher"] is False
-
-
-def test_viewer_reconnect_with_same_device_keeps_new_session(client: TestClient, sockets: ExitStack, settings: Settings) -> None:
-    """Regression for the bug that left phones stuck on 'connecting' after a reload."""
-    pub = connect(sockets, client, "publisher", settings.publisher_key, device_id="ipad")
-    pub.receive_json()
-
-    old = connect(sockets, client, "viewer", settings.viewer_key, device_id="pixel")
-    old.receive_json()
-    old.send_json({"type": "join"})
-    old.receive_json()
-    assert pub.receive_json()["type"] == "viewer_joined"
-
-    new = connect(sockets, client, "viewer", settings.viewer_key, device_id="pixel")
-    assert new.receive_json() == {"type": "auth_ok", "id": "pixel"}
-    assert close_code(old) == CLOSE_REPLACED
-    assert pub.receive_json() == {"type": "viewer_left", "viewer_id": "pixel"}
-
-    new.send_json({"type": "join"})
-    assert new.receive_json() == {"type": "publisher_online"}
-    assert pub.receive_json() == {"type": "viewer_joined", "viewer_id": "pixel"}
-
-    # The offer must reach the new socket even though the old one has now been cleaned up.
-    pub.send_json({"type": "offer", "viewer_id": "pixel", "session": "s2", "sdp": "OFFER"})
-    assert new.receive_json() == {"type": "offer", "session": "s2", "sdp": "OFFER"}
-    assert client.get("/healthz").json()["viewers"] == 1
-
-    new.close()
-    assert pub.receive_json() == {"type": "viewer_left", "viewer_id": "pixel"}
-    pub.close()
-
-
-def test_viewer_limit_and_publisher_replacement(client: TestClient, sockets: ExitStack, settings: Settings) -> None:
-    a = connect(sockets, client, "viewer", settings.viewer_key, device_id="a")
-    a.receive_json()
-    b = connect(sockets, client, "viewer", settings.viewer_key, device_id="b")
-    b.receive_json()
-    c = connect(sockets, client, "viewer", settings.viewer_key, device_id="c")
-    c.receive_json()
-    assert c.receive_json() == {"type": "error", "reason": "too_many_viewers"}
-    assert close_code(c) == CLOSE_TOO_MANY_VIEWERS
-
-    first = connect(sockets, client, "publisher", settings.publisher_key, device_id="ipad")
-    first.receive_json()
-    assert a.receive_json() == {"type": "publisher_changed"}
-    assert b.receive_json() == {"type": "publisher_changed"}
-
-    second = connect(sockets, client, "publisher", settings.publisher_key, device_id="ipad")
-    second.receive_json()
-    assert close_code(first) == CLOSE_REPLACED
-    assert a.receive_json() == {"type": "publisher_changed"}
-    assert b.receive_json() == {"type": "publisher_changed"}
-    assert client.get("/healthz").json() == {"publisher": True, "viewers": 2, "max_viewers": 2}
-
-    second.close()
-    assert a.receive_json() == {"type": "publisher_offline"}
-    assert b.receive_json() == {"type": "publisher_offline"}
-    a.close()
-    b.close()
-
-
-# ------------------------------------------------------- mDNS unmasking
-
-
-def test_tailscale_ip_helpers() -> None:
-    from main import has_real_candidate, is_tailscale_ip, routable_ip, unmask_mdns
-
-    assert is_tailscale_ip("100.82.199.26")
-    assert is_tailscale_ip("fd7a:115c:a1e0::6a4e:c71b")
-    assert not is_tailscale_ip("192.168.2.181")
-    assert not is_tailscale_ip("garbage")
-
-    assert routable_ip("100.82.199.26", "") == "100.82.199.26"
-    assert routable_ip("127.0.0.1", "100.1.1.1") == "100.1.1.1"
-    assert routable_ip("127.0.0.1", "") == ""
-    assert routable_ip("192.168.2.181", "100.1.1.1") == ""
-
-    cand = {"candidate": "candidate:1 1 udp 2122 93cbf8bf-b7ea-459e-9221-22c6645bb206.local 5000 typ host", "sdpMid": "0"}
-    out = unmask_mdns({"candidate": cand, "session": "s"}, "100.64.0.5")
-    assert out["candidate"]["candidate"] == "candidate:1 1 udp 2122 100.64.0.5 5000 typ host"
-    assert out["candidate"]["sdpMid"] == "0"
-    assert cand["candidate"].endswith(".local 5000 typ host"), "input not mutated"
-    sdp = "v=0\r\na=candidate:1 1 udp 2122 1c69a762-f518-4a90-9571-a4f2af23325c.local 6000 typ host\r\nc=IN IP4 0.0.0.0\r\n"
-    assert "100.64.0.5 6000" in unmask_mdns({"sdp": sdp}, "100.64.0.5")["sdp"]
-    assert unmask_mdns({"sdp": sdp}, "") == {"sdp": sdp}
-    assert unmask_mdns({"sdp": "a=candidate:1 1 udp 2122 192.168.1.2 7 typ host"}, "100.64.0.5")["sdp"].endswith("192.168.1.2 7 typ host")
-
-    assert has_real_candidate({"candidate": {"candidate": "candidate:1 ..."}})
-    assert not has_real_candidate({"candidate": {"candidate": ""}})
-    assert not has_real_candidate({"candidate": None})
-    assert not has_real_candidate({})
-
-
-def test_relay_unmasks_mdns_for_tailnet_clients(settings: Settings) -> None:
-    with TestClient(create_app(settings), client=("100.64.0.9", 40000)) as client, ExitStack() as sockets:
-        pub = connect(sockets, client, "publisher", settings.publisher_key, device_id="ipad")
-        pub.receive_json()
-        viewer = connect(sockets, client, "viewer", settings.viewer_key, device_id="pixel")
-        viewer.receive_json()
-        viewer.send_json({"type": "join"})
-        viewer.receive_json()
-        pub.receive_json()
-
-        pub.send_json({"type": "offer", "viewer_id": "pixel", "session": "s",
-                       "sdp": "a=candidate:1 1 udp 1 abcdef12-3456.local 9 typ host"})
-        assert viewer.receive_json()["sdp"] == "a=candidate:1 1 udp 1 100.64.0.9 9 typ host"
-
-        viewer.send_json({"type": "ice", "session": "s", "candidate": {"candidate": "candidate:1 1 udp 1 abcdef12-3456.local 9 typ host"}})
-        viewer.send_json({"type": "ice", "session": "s", "candidate": {"candidate": ""}})  # end-of-candidates: dropped
-        viewer.send_json({"type": "ping"})
-        assert pub.receive_json()["candidate"]["candidate"] == "candidate:1 1 udp 1 100.64.0.9 9 typ host"
-        assert viewer.receive_json() == {"type": "pong"}
-        pub.send_json({"type": "ice", "viewer_id": "pixel", "session": "s", "candidate": {"candidate": ""}})
-        pub.send_json({"type": "ping"})
-        assert pub.receive_json() == {"type": "pong"}
+    assert parse_token_request(b'{"role": "viewer", "key": "k"}') == {"role": "viewer", "key": "k", "device_id": ""}
+    assert parse_token_request(b'{"role": "viewer", "key": "k", "device_id": null}') == {"role": "viewer", "key": "k", "device_id": ""}
+    assert parse_token_request(b'{"role": "viewer", "key": "k", "pad": "' + b"a" * 20000 + b'"}') is None

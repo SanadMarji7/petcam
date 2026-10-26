@@ -1,0 +1,45 @@
+# LiveKit server configuration for Petcam. Replace <domain> with your domain,
+# or run ./configure.sh <domain>. Reference:
+# https://docs.livekit.io/home/self-hosting/deployment/
+#
+# API keys are NOT in this file. They are passed through the LIVEKIT_KEYS
+# environment variable from petcam.env (see docker-compose.yml), so the same
+# key/secret pair is defined once and this file contains nothing secret.
+# If you prefer them here instead, add:
+#   keys:
+#     <livekit_api_key>: <livekit_api_secret>
+# and remove the LIVEKIT_KEYS line from petcam.env.
+
+# Signaling (WebSocket) and HTTP API. Caddy proxies https://lk.<domain> here.
+port: 7880
+bind_addresses:
+  - ""   # all interfaces; the firewall keeps 7880 off the internet
+
+rtc:
+  # ICE over TCP for networks that block UDP entirely. Open TCP 7881.
+  tcp_port: 7881
+  # Media over UDP. Open UDP 50000-60000.
+  port_range_start: 50000
+  port_range_end: 60000
+  # The VPS knows only its private/interface address in some clouds; with this
+  # on, LiveKit discovers its public IP through STUN and advertises that.
+  use_external_ip: true
+  enable_loopback_candidate: false
+
+redis:
+  address: localhost:6379
+
+turn:
+  enabled: true
+  # Must match the certificate Caddy obtains, i.e. the SNI route in caddy.yaml.
+  domain: turn.<domain>
+  # Plain (already decrypted) TURN from Caddy arrives here. Clients are told to
+  # use turns://turn.<domain>:443, which is what external_tls means.
+  tls_port: 5349
+  external_tls: true
+  # TURN over UDP, directly exposed. Open UDP 3478.
+  udp_port: 3478
+
+logging:
+  level: info
+  json: false

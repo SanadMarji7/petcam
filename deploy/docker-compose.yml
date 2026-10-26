@@ -1,0 +1,72 @@
+# Petcam production stack: LiveKit (media), Redis, Caddy (TLS + port 443
+# multiplexing) and the Petcam control plane. Step-by-step instructions are in
+# deploy/DEPLOY.md. Run every `docker compose` command from this directory.
+#
+# This layout follows LiveKit's own self-hosting generator
+# (https://docs.livekit.io/home/self-hosting/vm/): LiveKit, Redis and Caddy use
+# host networking because WebRTC needs a 10 000-port UDP range, which Docker's
+# bridge network cannot publish efficiently. Host networking only works on
+# Linux, which a VPS is.
+#
+# Secrets (API keys, pairing keys) live in petcam.env, created by configure.sh.
+
+services:
+  caddy:
+    # Caddy with the layer4 plugin, built by LiveKit. It gets Let's Encrypt
+    # certificates for all three names and routes port 443 by SNI:
+    #   app.<domain>  -> Petcam control plane (localhost:8000)
+    #   lk.<domain>   -> LiveKit signaling (localhost:7880)
+    #   turn.<domain> -> LiveKit TURN/TLS   (localhost:5349)
+    image: livekit/caddyl4
+    command: run --config /etc/caddy.yaml --adapter yaml
+    restart: unless-stopped
+    network_mode: "host"
+    volumes:
+      - ./caddy.yaml:/etc/caddy.yaml:ro
+      - ./caddy_data:/data   # certificates; keep it, or Let's Encrypt rate limits bite
+
+  livekit:
+    image: livekit/livekit-server:v1.13
+    command: --config /etc/livekit.yaml
+    restart: unless-stopped
+    network_mode: "host"
+    # LIVEKIT_KEYS ("key: secret") comes from petcam.env so the API secret is
+    # written in exactly one place and livekit.yaml can stay in git.
+    env_file:
+      - petcam.env
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server /etc/redis.conf
+    restart: unless-stopped
+    network_mode: "host"   # redis.conf binds to 127.0.0.1 only
+    volumes:
+      - ./redis.conf:/etc/redis.conf:ro
+
+  petcam:
+    # The FastAPI control plane: serves /cam and /watch, mints LiveKit tokens.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: petcam:local
+    restart: unless-stopped
+    env_file:
+      - petcam.env
+    # Published on the loopback interface only. Caddy (host network) proxies
+    # https://app.<domain> to it; nothing else on the internet can reach 8000.
+    # Keep it that way: the Dockerfile tells uvicorn to trust X-Forwarded-For
+    # from every peer, which is only safe while Caddy is the only peer.
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      - livekit
+    # Keep logs bounded; the app logs one line per token request.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
