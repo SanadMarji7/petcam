@@ -2,432 +2,472 @@
 'use strict';
 
 /**
- * Petcam Common Utilities:
- * - Diagnostic In-Memory Log Ring (stores up to 200 logs for on-screen inspection)
- * - Robust Signaling WebSocket with exponential backoff & heartbeat
- * - WebRTC stats reader
+ * Petcam shared browser code, loaded by /cam and /watch with a plain <script>.
+ *
+ *  - log(): console + on-page diagnostic log (long-press the status strip)
+ *  - SignalingClient: WebSocket wrapper with auth handshake, heartbeat, backoff
+ *  - readVideoStats() / describeSelectedPair(): small getStats() readers
+ *  - helpers for the pairing key in the URL fragment and the per-device id
  */
+(function () {
+  const Petcam = (window.Petcam = window.Petcam || {});
 
-window.Petcam = window.Petcam || {};
-
-// 1. Diagnostic Logging
-const MAX_LOGS = 200;
-const logEntries = [];
-
-/**
- * Log helper that prints to browser console and appends to in-memory diagnostics
- * @param {string} level - 'info' | 'warn' | 'error'
- * @param {string} msg - Message to log
- * @param {any} [data] - Optional details
- */
-function log(level, msg, data) {
-  const ts = new Date().toISOString().substring(11, 19);
-  const formatted = `[${ts}] [${level.toUpperCase()}] ${msg}${data !== undefined ? ' ' + JSON.stringify(data) : ''}`;
-
-  if (level === 'error') {
-    console.error(formatted);
-  } else if (level === 'warn') {
-    console.warn(formatted);
-  } else {
-    console.log(formatted);
-  }
-
-  logEntries.push({ ts, level, msg, data });
-  if (logEntries.length > MAX_LOGS) {
-    logEntries.shift();
-  }
-
-  const container = document.getElementById('log-entries');
-  if (container) {
-    const el = document.createElement('div');
-    el.className = `log-entry ${level === 'warn' ? 'warn' : level === 'error' ? 'err' : ''}`;
-    el.textContent = formatted;
-    container.appendChild(el);
-    container.scrollTop = container.scrollHeight;
-  }
-}
-
-// Wire long press on status strip to open diagnostic log modal
-function initDiagnosticsUI() {
-  const statusStrip = document.getElementById('status-strip') || document.getElementById('publisher-footer');
-  const modal = document.getElementById('log-modal');
-  const closeBtn = document.getElementById('close-log-btn');
-
-  if (!statusStrip || !modal) return;
-
-  let pressTimer = null;
-
-  const startPress = () => {
-    pressTimer = setTimeout(() => {
-      modal.classList.remove('hidden');
-    }, 800); // 800ms long press
+  // Close codes the server uses (see hub.py).
+  const CLOSE = {
+    MALFORMED: 4400,
+    UNAUTHORIZED: 4401,
+    TIMEOUT: 4408,
+    TOO_MANY_VIEWERS: 4409,
+    REPLACED: 4410,
   };
 
-  const cancelPress = () => {
-    if (pressTimer) {
-      clearTimeout(pressTimer);
-      pressTimer = null;
-    }
-  };
+  // --------------------------------------------------------------- logging
 
-  statusStrip.addEventListener('mousedown', startPress);
-  statusStrip.addEventListener('mouseup', cancelPress);
-  statusStrip.addEventListener('mouseleave', cancelPress);
-  statusStrip.addEventListener('touchstart', startPress, { passive: true });
-  statusStrip.addEventListener('touchend', cancelPress);
-  statusStrip.addEventListener('touchcancel', cancelPress);
+  const MAX_LOG_ENTRIES = 300;
+  const logEntries = [];
 
-  if (closeBtn) {
-    closeBtn.addEventListener('click', () => {
-      modal.classList.add('hidden');
-    });
-  }
-}
-
-// 2. Signaling WebSocket Client
-class SignalingClient {
   /**
-   * @param {Object} options
-   * @param {string} options.role - 'publisher' | 'viewer'
-   * @param {() => string} options.getKey - Function returning authentication key
-   * @param {(msg: any) => void} options.onMessage - Message handler
-   * @param {(state: 'connecting' | 'open' | 'closed' | 'error') => void} [options.onStateChange]
-   * @param {() => void} [options.onAuthOk]
-   * @param {(reason: string) => void} [options.onAuthFailed]
+   * @param {'info' | 'warn' | 'error'} level
+   * @param {string} message
+   * @param {unknown} [detail]
    */
-  constructor(options) {
-    this.role = options.role;
-    this.getKey = options.getKey;
-    this.getDeviceId = options.getDeviceId;
-    this.onMessage = options.onMessage;
-    this.onStateChange = options.onStateChange || (() => {});
-    this.onAuthOk = options.onAuthOk || (() => {});
-    this.onAuthFailed = options.onAuthFailed || (() => {});
-
-    /** @type {WebSocket | null} */
-    this.ws = null;
-    this.clientId = null;
-    this.isAuthenticated = false;
-    this.isManualClose = false;
-
-    // Exponential backoff parameters (1s, 2s, 4s ... max 30s + jitter)
-    this.reconnectAttempts = 0;
-    this.reconnectTimer = null;
-    this.pingTimer = null;
-  }
-
-  connect() {
-    this.isManualClose = false;
-    this.clearTimers();
-
-    const key = this.getKey();
-    if (!key) {
-      log('warn', 'Signaling connect skipped: No key provided');
-      return;
-    }
-
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const endpoint = this.role === 'publisher' ? '/ws/publisher' : '/ws/viewer';
-    const wsUrl = `${proto}//${window.location.host}${endpoint}`;
-
-    log('info', `Connecting WebSocket to ${wsUrl} (role: ${this.role})`);
-    this.onStateChange('connecting');
-
-    try {
-      this.ws = new WebSocket(wsUrl);
-    } catch (e) {
-      log('error', `WebSocket creation failed: ${e.message}`);
-      this.scheduleReconnect();
-      return;
-    }
-
-    this.ws.onopen = () => {
-      log('info', 'WebSocket opened. Sending authentication handshake...');
-      this.onStateChange('connecting');
-      this.reconnectAttempts = 0;
-
-      // First message must be {"type": "auth", "key": "...", "device_id": "..."} within 5s
-      const authPayload = {
-        type: 'auth',
-        key: this.getKey(),
-      };
-      if (this.getDeviceId) {
-        authPayload.device_id = this.getDeviceId();
-      }
-      this.send(authPayload);
-    };
-
-    this.ws.onmessage = (event) => {
+  function log(level, message, detail) {
+    const ts = new Date().toISOString().substring(11, 19);
+    let text = `[${ts}] [${level.toUpperCase()}] ${message}`;
+    if (detail !== undefined) {
       try {
-        const msg = JSON.parse(event.data);
-
-        // Handle internal auth confirmation
-        if (msg.type === 'auth_ok') {
-          this.isAuthenticated = true;
-          this.clientId = msg.id;
-          log('info', `Authentication confirmed. Client ID: ${this.clientId}`);
-          this.onStateChange('open');
-          this.startHeartbeat();
-          this.onAuthOk();
-          return;
-        }
-
-        // Pong response
-        if (msg.type === 'pong') {
-          return;
-        }
-
-        this.onMessage(msg);
-      } catch (err) {
-        log('warn', `Failed to parse incoming WebSocket message: ${err.message}`);
+        text += ' ' + (typeof detail === 'string' ? detail : JSON.stringify(detail));
+      } catch (_) {
+        text += ' ' + String(detail);
       }
-    };
+    }
+    (level === 'error' ? console.error : level === 'warn' ? console.warn : console.log)(text);
 
-    this.ws.onerror = (err) => {
-      log('warn', 'WebSocket encountered error', err);
-      this.onStateChange('error');
-    };
+    logEntries.push(text);
+    if (logEntries.length > MAX_LOG_ENTRIES) logEntries.shift();
 
-    this.ws.onclose = (event) => {
-      const code = event.code;
-      const reason = event.reason || 'Closed';
-      log('warn', `WebSocket closed (code: ${code}, reason: ${reason})`);
-      this.stopHeartbeat();
-      this.isAuthenticated = false;
-      this.clientId = null;
-      this.onStateChange('closed');
-
-      if (code === 4401) {
-        // Authentication failed — do not auto-retry with bad key
-        log('error', 'Authentication rejected by server (code 4401)');
-        this.onAuthFailed(reason);
-        return;
+    const container = document.getElementById('log-entries');
+    if (container) {
+      const el = document.createElement('div');
+      el.className = 'log-entry' + (level === 'warn' ? ' warn' : level === 'error' ? ' err' : '');
+      el.textContent = text;
+      container.appendChild(el);
+      while (container.childElementCount > MAX_LOG_ENTRIES) {
+        container.removeChild(container.firstChild);
       }
-
-      if (code === 4409) {
-        // Max viewers reached
-        log('error', 'Viewer limit exceeded on server (code 4409)');
-        this.onAuthFailed('Viewer limit reached on server. Try again later.');
-        return;
-      }
-
-      if (!this.isManualClose) {
-        this.scheduleReconnect();
-      }
-    };
+      container.scrollTop = container.scrollHeight;
+    }
   }
 
-  send(data) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      log('warn', 'Cannot send: WebSocket is not OPEN');
-      return false;
-    }
+  /** Long-press (800 ms) on the status strip opens the diagnostic log. */
+  function initDiagnosticsUI() {
+    const strip = document.getElementById('status-strip') || document.getElementById('publisher-footer');
+    const modal = document.getElementById('log-modal');
+    const closeBtn = document.getElementById('close-log-btn');
+    if (!strip || !modal) return;
+
+    let timer = null;
+    const start = () => {
+      cancel();
+      timer = setTimeout(() => modal.classList.remove('hidden'), 800);
+    };
+    const cancel = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+    };
+    strip.addEventListener('mousedown', start);
+    strip.addEventListener('mouseup', cancel);
+    strip.addEventListener('mouseleave', cancel);
+    strip.addEventListener('touchstart', start, { passive: true });
+    strip.addEventListener('touchend', cancel);
+    strip.addEventListener('touchcancel', cancel);
+    closeBtn?.addEventListener('click', () => modal.classList.add('hidden'));
+  }
+
+  // ------------------------------------------------------------- utilities
+
+  /** Pull `#key=...` out of the URL (QR pairing), store it and scrub the address bar. */
+  function takeKeyFromFragment(storageKey) {
+    const hash = window.location.hash.replace(/^#/, '');
+    if (!hash) return null;
+    const params = new URLSearchParams(hash);
+    const key = (params.get('key') || '').trim();
+    if (key.length < 32) return null;
     try {
-      this.ws.send(JSON.stringify(data));
-      return true;
-    } catch (e) {
-      log('error', `WebSocket send error: ${e.message}`);
-      return false;
+      localStorage.setItem(storageKey, key);
+    } catch (_) {
+      /* private mode: the key still works for this page load */
+    }
+    window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
+    log('info', 'Pairing key imported from the QR link');
+    return key;
+  }
+
+  function readStoredKey(storageKey) {
+    try {
+      return localStorage.getItem(storageKey) || '';
+    } catch (_) {
+      return '';
     }
   }
 
-  startHeartbeat() {
-    this.stopHeartbeat();
-    // Ping every 10 seconds (server watchdog timeout is 30s)
-    this.pingTimer = setInterval(() => {
-      if (this.isAuthenticated && this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.send({ type: 'ping' });
+  function storeKey(storageKey, value) {
+    try {
+      if (value) localStorage.setItem(storageKey, value);
+      else localStorage.removeItem(storageKey);
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  /** Stable id per browser so a reload replaces the old session instead of adding one. */
+  function getDeviceId(storageKey) {
+    let id = readStoredKey(storageKey);
+    if (!id) {
+      const rand =
+        window.crypto && typeof window.crypto.randomUUID === 'function'
+          ? window.crypto.randomUUID().replace(/-/g, '').slice(0, 12)
+          : Math.random().toString(36).slice(2, 14);
+      id = 'dev_' + rand;
+      storeKey(storageKey, id);
+    }
+    return id;
+  }
+
+  function randomId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID().replace(/-/g, '').slice(0, 10);
+    }
+    return Math.random().toString(36).slice(2, 12);
+  }
+
+  /** ICE servers from the server config; falls back to none (Tailscale host candidates). */
+  async function loadIceServers() {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4000);
+      const res = await fetch('/config.json', { cache: 'no-store', signal: controller.signal });
+      clearTimeout(timer);
+      const data = await res.json();
+      if (data && Array.isArray(data.ice_servers)) {
+        log('info', `ICE servers from config: ${data.ice_servers.length}`);
+        return data.ice_servers;
       }
-    }, 10000);
-  }
-
-  stopHeartbeat() {
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
+    } catch (err) {
+      log('warn', `Could not load /config.json (${err.message}); using no STUN`);
     }
+    return [];
   }
 
-  scheduleReconnect() {
-    if (this.reconnectTimer) return;
-
-    this.reconnectAttempts++;
-    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, up to 30s, + jitter
-    const delay = Math.min(30000, Math.pow(2, this.reconnectAttempts - 1) * 1000) + Math.random() * 500;
-    log('info', `Scheduling reconnect in ${(delay / 1000).toFixed(1)}s (attempt ${this.reconnectAttempts})`);
-
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect();
-    }, delay);
+  function rtcConfig(iceServers) {
+    return { iceServers: iceServers, bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' };
   }
 
-  clearTimers() {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    this.stopHeartbeat();
+  function describeCandidate(candidate) {
+    if (!candidate) return 'none';
+    const c = candidate.candidate || '';
+    const parts = c.split(' ');
+    // "candidate:... 1 udp 2122 <address> <port> typ host ..."
+    const address = parts.length > 5 ? parts[4] : '?';
+    const typeIdx = parts.indexOf('typ');
+    const type = typeIdx >= 0 ? parts[typeIdx + 1] : candidate.type || '?';
+    return `${type} ${address}`;
   }
 
-  close() {
-    this.isManualClose = true;
-    this.clearTimers();
-    if (this.ws) {
-      try {
-        this.ws.close();
-      } catch (e) {}
+  // ----------------------------------------------------------- signaling
+
+  class SignalingClient {
+    /**
+     * @param {Object} o
+     * @param {'publisher' | 'viewer'} o.role
+     * @param {() => string} o.getKey
+     * @param {() => string} [o.getDeviceId]
+     * @param {(msg: any) => void} o.onMessage
+     * @param {(clientId: string, reconnect: boolean) => void} [o.onOpen]     after auth_ok
+     * @param {(code: number, reason: string) => void} [o.onClose]
+     * @param {(reason: string) => void} [o.onAuthFailed]                     wrong key: no retry
+     * @param {(reason: string) => void} [o.onReplaced]                       newer session took over: no retry
+     * @param {(reason: string) => void} [o.onViewerLimit]                    retried slowly
+     */
+    constructor(o) {
+      this.role = o.role;
+      this.getKey = o.getKey;
+      this.getDeviceId = o.getDeviceId || null;
+      this.onMessage = o.onMessage;
+      this.onOpen = o.onOpen || (() => {});
+      this.onClose = o.onClose || (() => {});
+      this.onAuthFailed = o.onAuthFailed || (() => {});
+      this.onReplaced = o.onReplaced || (() => {});
+      this.onViewerLimit = o.onViewerLimit || (() => {});
+
+      /** @type {WebSocket | null} */
       this.ws = null;
+      this.clientId = null;
+      this.authenticated = false;
+      this.everAuthenticated = false;
+      this.stopped = false;
+      this.reconnectAttempts = 0;
+      this.reconnectTimer = null;
+      this.heartbeatTimer = null;
+      this.lastPong = 0;
     }
-  }
-}
 
-// 3. WebRTC Stats Helper
-/**
- * Reads video statistics from RTCPeerConnection
- * @param {RTCPeerConnection} pc
- * @param {'inbound' | 'outbound'} direction
- * @returns {Promise<{width: number, height: number, fps: number, frames: number, bytes: number}>}
- */
-async function readVideoStats(pc, direction) {
-  const result = { width: 0, height: 0, fps: 0, frames: 0, bytes: 0 };
-  if (!pc) return result;
+    get isOpen() {
+      return this.authenticated && !!this.ws && this.ws.readyState === WebSocket.OPEN;
+    }
 
-  try {
-    const stats = await pc.getStats();
-    stats.forEach((report) => {
-      if (direction === 'inbound' && report.type === 'inbound-rtp' && report.kind === 'video') {
-        result.width = report.frameWidth || 0;
-        result.height = report.frameHeight || 0;
-        result.fps = report.framesPerSecond ? Math.round(report.framesPerSecond) : 0;
-        result.frames = report.framesDecoded || 0;
-        result.bytes = report.bytesReceived || 0;
-      } else if (direction === 'outbound' && report.type === 'outbound-rtp' && report.kind === 'video') {
-        result.width = report.frameWidth || 0;
-        result.height = report.frameHeight || 0;
-        result.fps = report.framesPerSecond ? Math.round(report.framesPerSecond) : 0;
-        result.frames = report.framesEncoded || 0;
-        result.bytes = report.bytesSent || 0;
+    connect() {
+      this.stopped = false;
+      this.clearReconnectTimer();
+      const key = this.getKey();
+      if (!key) {
+        log('warn', 'Not connecting: no key');
+        return;
       }
-    });
-  } catch (e) {
-    // getStats failed or connection closed
-  }
-  return result;
-}
+      this.disposeSocket();
 
-// 4. Client-Side QR Code Generator
-// Generates scannable QR Code SVG for pairing URLs
-function renderQr(container, text) {
-  if (!container) return;
-  container.innerHTML = '';
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const url = `${proto}//${window.location.host}/ws/${this.role}`;
+      log('info', `Signaling: connecting to ${url}`);
 
-  // Minimal standard QR code matrix generator (supports up to ~120 chars URL with Version 4/5)
-  try {
-    const svg = createQrSvg(text);
-    container.appendChild(svg);
-  } catch (e) {
-    // Fallback: visual high-contrast code box with pairing URL
-    container.innerHTML = `<div style="padding:10px;font-size:11px;font-family:monospace;color:#000;">${text}</div>`;
-  }
-}
+      let ws;
+      try {
+        ws = new WebSocket(url);
+      } catch (err) {
+        log('error', `WebSocket could not be created: ${err.message}`);
+        this.scheduleReconnect();
+        return;
+      }
+      this.ws = ws;
+      this.authenticated = false;
 
-// Lightweight QR matrix generator
-function createQrSvg(data) {
-  // Use HTML5 canvas to generate crisp scannable QR code using standard patterns
-  const canvas = document.createElement('canvas');
-  canvas.width = 220;
-  canvas.height = 220;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return canvas;
+      ws.onopen = () => {
+        if (ws !== this.ws) return;
+        const auth = { type: 'auth', key: this.getKey() };
+        if (this.getDeviceId) auth.device_id = this.getDeviceId();
+        this.send(auth);
+      };
 
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, 220, 220);
-  ctx.fillStyle = '#000000';
+      ws.onmessage = (event) => {
+        if (ws !== this.ws) return;
+        let msg;
+        try {
+          msg = JSON.parse(event.data);
+        } catch (_) {
+          log('warn', 'Signaling: ignored a non-JSON frame');
+          return;
+        }
+        if (!msg || typeof msg.type !== 'string') return;
 
-  // Draw 29x29 matrix (Version 3)
-  const size = 29;
-  const cellSize = Math.floor(200 / size);
-  const offset = Math.floor((220 - size * cellSize) / 2);
+        if (msg.type === 'auth_ok') {
+          const reconnect = this.everAuthenticated;
+          this.authenticated = true;
+          this.everAuthenticated = true;
+          this.clientId = msg.id;
+          this.reconnectAttempts = 0;
+          this.lastPong = Date.now();
+          this.startHeartbeat();
+          log('info', `Signaling: authenticated as ${this.role} [${this.clientId}]${reconnect ? ' (reconnected)' : ''}`);
+          this.onOpen(this.clientId, reconnect);
+          return;
+        }
+        if (msg.type === 'pong') {
+          this.lastPong = Date.now();
+          return;
+        }
+        this.onMessage(msg);
+      };
 
-  const grid = Array.from({ length: size }, () => Array(size).fill(false));
+      ws.onerror = () => {
+        if (ws !== this.ws) return;
+        log('warn', 'Signaling: socket error');
+      };
 
-  // Finder pattern helper
-  const drawFinder = (startX, startY) => {
-    for (let y = 0; y < 7; y++) {
-      for (let x = 0; x < 7; x++) {
-        if (
-          x === 0 || x === 6 || y === 0 || y === 6 ||
-          (x >= 2 && x <= 4 && y >= 2 && y <= 4)
-        ) {
-          grid[startY + y][startX + x] = true;
+      ws.onclose = (event) => {
+        if (ws !== this.ws) return;
+        this.ws = null;
+        this.authenticated = false;
+        this.stopHeartbeat();
+        const reason = event.reason || 'closed';
+        log('warn', `Signaling: closed (code ${event.code}: ${reason})`);
+        this.onClose(event.code, reason);
+
+        if (event.code === CLOSE.UNAUTHORIZED) {
+          this.onAuthFailed(reason);
+          return;
+        }
+        if (event.code === CLOSE.REPLACED) {
+          this.stopped = true;
+          this.onReplaced(reason);
+          return;
+        }
+        if (event.code === CLOSE.TOO_MANY_VIEWERS) {
+          this.onViewerLimit(reason);
+          if (!this.stopped) this.scheduleReconnect(30000);
+          return;
+        }
+        if (!this.stopped) this.scheduleReconnect();
+      };
+    }
+
+    /** @returns {boolean} */
+    send(data) {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        log('warn', `Signaling: cannot send '${data && data.type}' (socket not open)`);
+        return false;
+      }
+      try {
+        this.ws.send(JSON.stringify(data));
+        return true;
+      } catch (err) {
+        log('error', `Signaling: send failed: ${err.message}`);
+        return false;
+      }
+    }
+
+    startHeartbeat() {
+      this.stopHeartbeat();
+      // Ping every 10 s (server drops silent clients after 30 s). If no pong
+      // comes back for 25 s the TCP connection is dead (e.g. Wi-Fi -> 5G
+      // switch): close it ourselves so the reconnect happens now, not minutes later.
+      this.heartbeatTimer = setInterval(() => {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        if (Date.now() - this.lastPong > 25000) {
+          log('warn', 'Signaling: no pong for 25 s, forcing reconnect');
+          try {
+            this.ws.close(4000, 'pong timeout');
+          } catch (_) {
+            /* ignore */
+          }
+          return;
+        }
+        this.send({ type: 'ping' });
+      }, 10000);
+    }
+
+    stopHeartbeat() {
+      if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+
+    scheduleReconnect(minDelayMs) {
+      if (this.reconnectTimer || this.stopped) return;
+      this.reconnectAttempts += 1;
+      // 1 s, 2 s, 4 s ... capped at 30 s, plus jitter so devices do not stampede.
+      let delay = Math.min(30000, 1000 * Math.pow(2, this.reconnectAttempts - 1)) + Math.random() * 500;
+      if (minDelayMs) delay = Math.max(delay, minDelayMs);
+      log('info', `Signaling: reconnect in ${(delay / 1000).toFixed(1)} s (attempt ${this.reconnectAttempts})`);
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        this.connect();
+      }, delay);
+    }
+
+    /** Reconnect right now (network came back, user tapped Reconnect). */
+    reconnectNow() {
+      this.reconnectAttempts = 0;
+      this.connect();
+    }
+
+    clearReconnectTimer() {
+      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    disposeSocket() {
+      const old = this.ws;
+      this.ws = null;
+      this.authenticated = false;
+      this.stopHeartbeat();
+      if (old) {
+        old.onopen = old.onmessage = old.onerror = old.onclose = null;
+        try {
+          old.close(1000, 'superseded');
+        } catch (_) {
+          /* ignore */
         }
       }
     }
-  };
 
-  drawFinder(0, 0);
-  drawFinder(size - 7, 0);
-  drawFinder(0, size - 7);
-
-  // Timing patterns
-  for (let i = 8; i < size - 8; i++) {
-    grid[6][i] = i % 2 === 0;
-    grid[i][6] = i % 2 === 0;
-  }
-
-  // Alignment pattern
-  const alignX = size - 7 - 2;
-  const alignY = size - 7 - 2;
-  for (let y = -2; y <= 2; y++) {
-    for (let x = -2; x <= 2; x++) {
-      if (Math.abs(x) === 2 || Math.abs(y) === 2 || (x === 0 && y === 0)) {
-        grid[alignY + y][alignX + x] = true;
-      }
+    close() {
+      this.stopped = true;
+      this.clearReconnectTimer();
+      this.disposeSocket();
     }
   }
 
-  // Data hash deterministic filling
-  let hash = 0;
-  for (let i = 0; i < data.length; i++) {
-    hash = (hash << 5) - hash + data.charCodeAt(i);
-    hash |= 0;
+  // ---------------------------------------------------------------- stats
+
+  /**
+   * @param {RTCPeerConnection | null} pc
+   * @param {'inbound' | 'outbound'} direction
+   * @returns {Promise<{width: number, height: number, fps: number, frames: number, bytes: number}>}
+   */
+  async function readVideoStats(pc, direction) {
+    const result = { width: 0, height: 0, fps: 0, frames: 0, bytes: 0 };
+    if (!pc || pc.connectionState === 'closed') return result;
+    try {
+      const stats = await pc.getStats();
+      stats.forEach((report) => {
+        if (report.kind !== 'video' && report.mediaType !== 'video') return;
+        if (direction === 'inbound' && report.type === 'inbound-rtp') {
+          result.width = report.frameWidth || 0;
+          result.height = report.frameHeight || 0;
+          result.fps = report.framesPerSecond ? Math.round(report.framesPerSecond) : 0;
+          result.frames = report.framesDecoded || 0;
+          result.bytes = report.bytesReceived || 0;
+        } else if (direction === 'outbound' && report.type === 'outbound-rtp') {
+          result.width = report.frameWidth || 0;
+          result.height = report.frameHeight || 0;
+          result.fps = report.framesPerSecond ? Math.round(report.framesPerSecond) : 0;
+          result.frames = report.framesEncoded || 0;
+          result.bytes = report.bytesSent || 0;
+        }
+      });
+    } catch (_) {
+      /* connection closed mid-call */
+    }
+    return result;
   }
 
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      // Don't overwrite finders or timing
-      const inFinder1 = x < 9 && y < 9;
-      const inFinder2 = x >= size - 9 && y < 9;
-      const inFinder3 = x < 9 && y >= size - 9;
-      const inTiming = x === 6 || y === 6;
-      const inAlign = Math.abs(x - alignX) <= 2 && Math.abs(y - alignY) <= 2;
-
-      if (!inFinder1 && !inFinder2 && !inFinder3 && !inTiming && !inAlign) {
-        const charIdx = (x * 7 + y * 13) % data.length;
-        const bit = ((data.charCodeAt(charIdx) ^ (x * y + hash)) & 1) === 1;
-        grid[y][x] = bit;
+  /** "host 100.1.2.3 -> prflx 100.4.5.6" for the active ICE pair, or null. */
+  async function describeSelectedPair(pc) {
+    if (!pc || pc.connectionState === 'closed') return null;
+    try {
+      const stats = await pc.getStats();
+      let pair = null;
+      stats.forEach((r) => {
+        if (r.type === 'transport' && r.selectedCandidatePairId) pair = stats.get(r.selectedCandidatePairId);
+      });
+      if (!pair) {
+        stats.forEach((r) => {
+          if (r.type === 'candidate-pair' && (r.selected || r.nominated) && r.state === 'succeeded') pair = r;
+        });
       }
+      if (!pair) return null;
+      const local = stats.get(pair.localCandidateId);
+      const remote = stats.get(pair.remoteCandidateId);
+      const fmt = (c) => (c ? `${c.candidateType || '?'} ${c.address || c.ip || '?'}:${c.port || '?'}` : '?');
+      return `${fmt(local)} -> ${fmt(remote)}`;
+    } catch (_) {
+      return null;
     }
   }
 
-  // Paint modules
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      if (grid[y][x]) {
-        ctx.fillRect(offset + x * cellSize, offset + y * cellSize, cellSize, cellSize);
-      }
-    }
-  }
+  Petcam.CLOSE = CLOSE;
+  Petcam.log = log;
+  Petcam.initDiagnosticsUI = initDiagnosticsUI;
+  Petcam.takeKeyFromFragment = takeKeyFromFragment;
+  Petcam.readStoredKey = readStoredKey;
+  Petcam.storeKey = storeKey;
+  Petcam.getDeviceId = getDeviceId;
+  Petcam.randomId = randomId;
+  Petcam.loadIceServers = loadIceServers;
+  Petcam.rtcConfig = rtcConfig;
+  Petcam.describeCandidate = describeCandidate;
+  Petcam.SignalingClient = SignalingClient;
+  Petcam.readVideoStats = readVideoStats;
+  Petcam.describeSelectedPair = describeSelectedPair;
 
-  return canvas;
-}
-
-// Expose on window
-window.Petcam.log = log;
-window.Petcam.SignalingClient = SignalingClient;
-window.Petcam.readVideoStats = readVideoStats;
-window.Petcam.initDiagnosticsUI = initDiagnosticsUI;
-window.Petcam.renderQr = renderQr;
-
-document.addEventListener('DOMContentLoaded', initDiagnosticsUI);
+  document.addEventListener('DOMContentLoaded', initDiagnosticsUI);
+})();

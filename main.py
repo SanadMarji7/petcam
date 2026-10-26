@@ -1,3 +1,12 @@
+"""Petcam signaling server.
+
+Serves the two pages (/cam for the iPad, /watch for phones and laptops) and
+relays WebRTC signaling between them over WebSockets. Media never touches this
+process: once the offer/answer exchange is done the video flows peer to peer
+between the iPad and each viewer.
+
+Run with:  uvicorn main:app --host 127.0.0.1 --port 8000
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,9 +17,8 @@ import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, status
@@ -18,9 +26,19 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from config import Settings, load_settings
+from config import ConfigError, Settings, load_settings
+from hub import (
+    CLOSE_MALFORMED,
+    CLOSE_TIMEOUT,
+    CLOSE_TOO_MANY_VIEWERS,
+    CLOSE_UNAUTHORIZED,
+    Client,
+    Hub,
+    Message,
+    Role,
+)
+from qrgen import qr_svg
 
-# Configure structured logging with timestamps
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -29,521 +47,327 @@ logging.basicConfig(
 )
 logger = logging.getLogger("petcam")
 
-MAX_MESSAGE_BYTES = 64 * 1024  # 64 KB max payload
+BASE_DIR = Path(__file__).resolve().parent
+
+MAX_MESSAGE_BYTES = 64 * 1024
+AUTH_TIMEOUT_SECONDS = 5.0
 HEARTBEAT_TIMEOUT_SECONDS = 30.0
-HEARTBEAT_CHECK_INTERVAL = 5.0
-RELAY_STATS_INTERVAL = 60.0
+HEARTBEAT_CHECK_INTERVAL_SECONDS = 5.0
+STATS_LOG_INTERVAL_SECONDS = 60.0
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# Fields a client may attach to a relayed message. Everything else is dropped.
+RELAY_FIELDS = ("sdp", "candidate", "session", "restart")
 
-
-@dataclass
-class Client:
-    websocket: WebSocket
-    role: str  # "publisher" | "viewer"
-    id: str
-    ip: str
-    connect_time: float = field(default_factory=time.time)
-    last_heartbeat: float = field(default_factory=time.time)
-
-    def touch(self) -> None:
-        self.last_heartbeat = time.time()
-
-
-class Hub:
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-        self.lock = asyncio.Lock()
-        self.publisher: Optional[Client] = None
-        self.viewers: dict[str, Client] = {}
-        self.relayed_messages_count: int = 0
-
-    async def get_health(self) -> dict[str, object]:
-        async with self.lock:
-            return {
-                "publisher": self.publisher is not None,
-                "viewers": len(self.viewers),
-                "max_viewers": self.settings.max_viewers,
-            }
-
-    async def set_publisher(self, new_client: Client) -> Optional[Client]:
-        old_publisher: Optional[Client] = None
-        async with self.lock:
-            if self.publisher is not None:
-                old_publisher = self.publisher
-                logger.info(
-                    "[%s:%s] Replacing existing publisher [%s]",
-                    new_client.role,
-                    new_client.id,
-                    old_publisher.id,
-                )
-            self.publisher = new_client
-
-            # Notify all connected viewers that publisher changed
-            for viewer_id, viewer in list(self.viewers.items()):
-                try:
-                    await viewer.websocket.send_text(json.dumps({"type": "publisher_changed"}))
-                except Exception as e:
-                    logger.warning("[%s:%s] Failed to send publisher_changed: %s", viewer.role, viewer_id, e)
-
-        return old_publisher
-
-    async def remove_publisher(self, client: Client) -> None:
-        async with self.lock:
-            if self.publisher is not None and self.publisher.id == client.id:
-                self.publisher = None
-                logger.info("[%s:%s] Publisher disconnected. Notifying %d viewers", client.role, client.id, len(self.viewers))
-                for viewer_id, viewer in list(self.viewers.items()):
-                    try:
-                        await viewer.websocket.send_text(json.dumps({"type": "publisher_offline"}))
-                    except Exception as e:
-                        logger.warning("[%s:%s] Failed to send publisher_offline: %s", viewer.role, viewer_id, e)
-
-    async def add_viewer(self, client: Client) -> bool:
-        async with self.lock:
-            # Check if this exact device is already registered (e.g. page refreshed or QR re-scanned)
-            existing = self.viewers.pop(client.id, None)
-            if existing is not None:
-                logger.info("[%s:%s] Existing session for device found. Replacing with new session.", client.role, client.id)
-                try:
-                    await existing.websocket.close(code=1000, reason="Replaced by new session from same device")
-                except Exception:
-                    pass
-                if self.publisher is not None:
-                    try:
-                        await self.publisher.websocket.send_text(
-                            json.dumps({"type": "viewer_left", "viewer_id": client.id})
-                        )
-                    except Exception:
-                        pass
-            elif len(self.viewers) >= self.settings.max_viewers:
-                logger.warning(
-                    "[%s:%s] Rejected connection: viewer limit reached (%d/%d)",
-                    client.role,
-                    client.id,
-                    len(self.viewers),
-                    self.settings.max_viewers,
-                )
-                return False
-
-            self.viewers[client.id] = client
-            logger.info("[%s:%s] Viewer registered (active viewers: %d)", client.role, client.id, len(self.viewers))
-            return True
-
-    async def remove_viewer(self, client: Client) -> None:
-        async with self.lock:
-            removed = self.viewers.pop(client.id, None)
-            if removed is not None:
-                logger.info("[%s:%s] Viewer disconnected (remaining: %d)", client.role, client.id, len(self.viewers))
-                if self.publisher is not None:
-                    try:
-                        await self.publisher.websocket.send_text(
-                            json.dumps({"type": "viewer_left", "viewer_id": client.id})
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "[%s:%s] Failed to notify publisher of viewer_left: %s",
-                            client.role,
-                            client.id,
-                            e,
-                        )
-
-    async def forward_to_publisher(self, msg: dict[str, object], source_client: Client) -> None:
-        async with self.lock:
-            if self.publisher is None:
-                return
-            try:
-                await self.publisher.websocket.send_text(json.dumps(msg))
-                self.relayed_messages_count += 1
-            except Exception as e:
-                logger.warning("[%s:%s] Failed to forward to publisher: %s", source_client.role, source_client.id, e)
-
-    async def forward_to_viewer(self, viewer_id: str, msg: dict[str, object], source_client: Client) -> None:
-        async with self.lock:
-            viewer = self.viewers.get(viewer_id)
-            if viewer is None:
-                logger.debug("[%s:%s] Viewer [%s] no longer active, dropped message", source_client.role, source_client.id, viewer_id)
-                return
-            try:
-                await viewer.websocket.send_text(json.dumps(msg))
-                self.relayed_messages_count += 1
-            except Exception as e:
-                logger.warning("[%s:%s] Failed forwarding to viewer [%s]: %s", source_client.role, source_client.id, viewer_id, e)
-
-
-# Global settings and hub (initialized in lifespan)
-try:
-    settings = load_settings()
-except Exception as err:
-    logger.warning("Default config.toml not found or invalid: %s. Using default fallback configuration.", err)
-    settings = Settings(
-        hostname="127.0.0.1:8000",
-        publisher_key="0123456789abcdef0123456789abcdef",
-        viewer_key="abcdef0123456789abcdef0123456789",
-        max_viewers=4,
-        stun_enabled=False,
-        port=8000,
-    )
-
-hub = Hub(settings)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    logger.info("==================================================")
-    logger.info("Petcam WebRTC Dog Monitor starting up")
-    logger.info("Configured hostname: %s", settings.hostname)
-    logger.info("Max viewers: %d", settings.max_viewers)
-    logger.info("STUN fallback enabled: %s", settings.stun_enabled)
-    logger.info("Listening target: 127.0.0.1:%d", settings.port)
-    logger.info("==================================================")
-
-    # Background task: watchdog for client heartbeats and periodic stats logging
-    watchdog_task = asyncio.create_task(run_heartbeat_watchdog(hub))
-    yield
-    watchdog_task.cancel()
-    try:
-        await watchdog_task
-    except asyncio.CancelledError:
-        pass
-    logger.info("Petcam server stopped.")
-
-
-async def run_heartbeat_watchdog(h: Hub) -> None:
-    last_stats_log = time.time()
-    while True:
-        try:
-            await asyncio.sleep(HEARTBEAT_CHECK_INTERVAL)
-            now = time.time()
-
-            # Check dead clients under lock
-            stale_clients: list[Client] = []
-            async with h.lock:
-                if h.publisher is not None:
-                    if now - h.publisher.last_heartbeat > HEARTBEAT_TIMEOUT_SECONDS:
-                        stale_clients.append(h.publisher)
-
-                for viewer in h.viewers.values():
-                    if now - viewer.last_heartbeat > HEARTBEAT_TIMEOUT_SECONDS:
-                        stale_clients.append(viewer)
-
-            for client in stale_clients:
-                logger.warning(
-                    "[%s:%s] Heartbeat timed out (>%.1fs). Closing socket.",
-                    client.role,
-                    client.id,
-                    HEARTBEAT_TIMEOUT_SECONDS,
-                )
-                try:
-                    await client.websocket.close(code=4408, reason="Heartbeat timeout")
-                except Exception:
-                    pass
-
-            if now - last_stats_log >= RELAY_STATS_INTERVAL:
-                async with h.lock:
-                    pub_status = "connected" if h.publisher is not None else "offline"
-                    v_count = len(h.viewers)
-                    relayed = h.relayed_messages_count
-                logger.info(
-                    "[STATS 60s] Publisher: %s | Active Viewers: %d | Relayed messages: %d",
-                    pub_status,
-                    v_count,
-                    relayed,
-                )
-                last_stats_log = now
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error("Watchdog loop encountered error: %s", e)
-
-
-app = FastAPI(title="Petcam", lifespan=lifespan)
-
-# Mount templates and static directory
-templates_dir = Path("templates")
-templates_dir.mkdir(parents=True, exist_ok=True)
-templates = Jinja2Templates(directory="templates")
-
-static_dir = Path("static")
-static_dir.mkdir(parents=True, exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-
-@app.middleware("http")
-async def add_security_headers(request: Request, call_next) -> Response:
-    response: Response = await call_next(request)
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Content-Security-Policy"] = (
+SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(self), microphone=(self), geolocation=()",
+    "Content-Security-Policy": (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; "
         "style-src 'self' 'unsafe-inline'; "
-        "connect-src 'self' ws: wss:; "
-        "media-src 'self' blob:; "
+        "img-src 'self' data:; "
+        "connect-src 'self' wss: ws:; "
+        "media-src 'self' blob: mediastream:; "
+        "manifest-src 'self'; "
         "object-src 'none'; "
-        "base-uri 'self';"
-    )
-    return response
+        "base-uri 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'"
+    ),
+}
 
 
-def verify_ws_origin(websocket: WebSocket, expected_hostname: str) -> bool:
-    origin = websocket.headers.get("origin")
+# ----------------------------------------------------------------- helpers
+
+
+def origin_allowed(origin: str | None, hostname: str) -> bool:
+    """Only pages served from our own hostname (or localhost in dev) may open a socket."""
     if not origin:
-        return True  # Some native WebSockets don't send Origin; allow
-    parsed = urlparse(origin)
-    netloc = parsed.netloc.lower()
-    expected = expected_hostname.lower()
-
-    # Compare exact hostname or allow localhost/127.0.0.1 during local testing
-    if netloc == expected or netloc.split(":")[0] == expected.split(":")[0]:
-        return True
-    if netloc.startswith("localhost") or netloc.startswith("127.0.0.1"):
-        return True
-
-    logger.warning("Rejected WebSocket connection: Origin header '%s' does not match '%s'", origin, expected)
-    return False
+        return True  # non-browser clients; they still need the key
+    host = (urlparse(origin).hostname or "").lower()
+    expected = hostname.split(":", 1)[0].lower()
+    return host == expected or host in LOOPBACK_HOSTS
 
 
-@app.get("/", response_class=RedirectResponse)
-async def root_redirect() -> RedirectResponse:
-    return RedirectResponse(url="/watch", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+def is_local_request(request: Request) -> bool:
+    """True only for requests made on the server itself, not via tailscale serve.
+
+    tailscale serve always adds X-Forwarded-* headers to proxied requests, so a
+    bare loopback request without them can only come from this machine.
+    """
+    host = request.client.host if request.client else ""
+    forwarded = any(name in request.headers for name in ("x-forwarded-for", "x-forwarded-host", "forwarded"))
+    return host in ("127.0.0.1", "::1") and not forwarded
 
 
-@app.get("/cam", response_class=HTMLResponse)
-async def get_cam_page(request: Request) -> Response:
-    return templates.TemplateResponse("cam.html", {"request": request})
-
-
-@app.get("/watch", response_class=HTMLResponse)
-async def get_watch_page(request: Request) -> Response:
-    return templates.TemplateResponse("watch.html", {"request": request})
-
-
-@app.get("/setup", response_class=HTMLResponse)
-async def get_setup_page(request: Request) -> Response:
-    # Build secure pairing URLs with fragment-encoded keys
-    cam_url = f"https://{settings.hostname}/cam#key={settings.publisher_key}"
-    watch_url = f"https://{settings.hostname}/watch#key={settings.viewer_key}"
-    return templates.TemplateResponse(
-        "setup.html",
-        {
-            "request": request,
-            "hostname": settings.hostname,
-            "cam_url": cam_url,
-            "watch_url": watch_url,
-        },
-    )
-
-
-@app.get("/healthz")
-async def get_healthz() -> dict[str, object]:
-    return await hub.get_health()
-
-
-@app.get("/config.json")
-async def get_client_config() -> dict[str, object]:
-    # Always supply reliable public STUN servers so modern browser .local mDNS host candidate obfuscation resolves
-    ice_servers: list[dict[str, str]] = [
-        {"urls": "stun:stun.l.google.com:19302"},
-        {"urls": "stun:stun1.l.google.com:19302"},
-    ]
-    return {
-        "stun_enabled": True,
-        "ice_servers": ice_servers,
-    }
-
-
-async def perform_auth_handshake(
-    websocket: WebSocket, expected_key: str, role: str, client_ip: str
-) -> Optional[str]:
-    """Waits up to 5 seconds for the auth message and performs constant-time comparison."""
-    try:
-        raw_msg = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
-    except asyncio.TimeoutError:
-        logger.warning("[%s] Auth handshake timeout from %s", role, client_ip)
-        await websocket.close(code=4401, reason="Auth timeout")
+def parse_message(raw: str) -> Message | None:
+    if len(raw.encode("utf-8")) > MAX_MESSAGE_BYTES:
         return None
-    except Exception as e:
-        logger.warning("[%s] Auth receive failed from %s: %s", role, client_ip, e)
-        return None
-
     try:
-        data = json.loads(raw_msg)
+        data = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning("[%s] Non-JSON auth message from %s", role, client_ip)
-        await websocket.close(code=4401, reason="Invalid JSON")
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("type"), str):
+        return None
+    return data
+
+
+def sanitize_device_id(value: object) -> str:
+    text = str(value or "").strip()[:64]
+    return "".join(ch for ch in text if ch.isalnum() or ch in "_-")
+
+
+def relay_payload(message: Message) -> Message:
+    return {name: message[name] for name in RELAY_FIELDS if name in message}
+
+
+# ---------------------------------------------------------- websocket logic
+
+
+async def authenticate(websocket: WebSocket, expected_key: str, role: Role, ip: str) -> str | None:
+    """First frame must be {"type":"auth","key":...} within 5 s. Returns the client id."""
+    try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=AUTH_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning("[%s] auth timeout from %s", role, ip)
+        await websocket.close(code=CLOSE_TIMEOUT, reason="Auth timeout")
+        return None
+    except (WebSocketDisconnect, RuntimeError):
         return None
 
-    if not isinstance(data, dict) or data.get("type") != "auth" or "key" not in data:
-        logger.warning("[%s] Invalid auth handshake message structure from %s", role, client_ip)
-        await websocket.close(code=4401, reason="Malformed auth message")
+    message = parse_message(raw)
+    if message is None or message.get("type") != "auth" or not isinstance(message.get("key"), str):
+        logger.warning("[%s] malformed auth message from %s", role, ip)
+        await websocket.close(code=CLOSE_MALFORMED, reason="Expected an auth message")
         return None
 
-    key = str(data["key"])
-    if not hmac.compare_digest(key, expected_key):
-        logger.warning("[%s] Invalid key provided from %s", role, client_ip)
-        await websocket.close(code=4401, reason="Authentication failed")
+    if not hmac.compare_digest(message["key"].encode("utf-8"), expected_key.encode("utf-8")):
+        logger.warning("[%s] wrong key from %s", role, ip)
+        await websocket.close(code=CLOSE_UNAUTHORIZED, reason="Authentication failed")
         return None
 
-    # Use persistent device_id if provided (e.g. from phone localStorage), else generate random id
-    raw_device_id = str(data.get("device_id") or "").strip()
-    if raw_device_id and len(raw_device_id) <= 64:
-        client_id = "".join(c for c in raw_device_id if c.isalnum() or c in "_-")
-    else:
-        client_id = secrets.token_hex(4)
-
+    client_id = sanitize_device_id(message.get("device_id")) or secrets.token_hex(4)
     await websocket.send_text(json.dumps({"type": "auth_ok", "id": client_id}))
-    logger.info("[%s:%s] Authentication successful from %s", role, client_id, client_ip)
+    logger.info("[%s:%s] authenticated from %s", role, client_id, ip)
     return client_id
 
 
-@app.websocket("/ws/publisher")
-async def publisher_websocket_endpoint(websocket: WebSocket) -> None:
-    client_ip = websocket.client.host if websocket.client else "unknown"
-    if not verify_ws_origin(websocket, settings.hostname):
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Origin disallowed")
+async def handle_publisher_message(hub: Hub, client: Client, message: Message) -> None:
+    kind = message["type"]
+    if kind == "ping":
+        await client.send({"type": "pong"})
+        return
+    if kind in ("offer", "ice"):
+        viewer_id = message.get("viewer_id")
+        if not isinstance(viewer_id, str) or not viewer_id:
+            logger.warning("[%s] '%s' without viewer_id dropped", client.tag, kind)
+            return
+        payload = relay_payload(message)
+        if kind == "offer" and not isinstance(payload.get("sdp"), str):
+            logger.warning("[%s] offer without sdp dropped", client.tag)
+            return
+        await hub.to_viewer(viewer_id, {"type": kind, **payload})
+        return
+    logger.warning("[%s] unknown message type '%s' dropped", client.tag, kind)
+
+
+async def handle_viewer_message(hub: Hub, client: Client, message: Message) -> None:
+    kind = message["type"]
+    if kind == "ping":
+        await client.send({"type": "pong"})
+    elif kind == "join":
+        await hub.viewer_join(client)
+    elif kind == "answer":
+        payload = relay_payload(message)
+        if not isinstance(payload.get("sdp"), str):
+            logger.warning("[%s] answer without sdp dropped", client.tag)
+            return
+        await hub.to_publisher({"type": "answer", "viewer_id": client.id, **payload})
+    elif kind == "ice":
+        await hub.to_publisher({"type": "ice", "viewer_id": client.id, **relay_payload(message)})
+    elif kind == "restart":
+        await hub.to_publisher({"type": "viewer_restart", "viewer_id": client.id})
+    elif kind == "quality":
+        quality = message.get("quality")
+        if quality not in ("auto", "high"):
+            quality = "auto"
+        await hub.to_publisher({"type": "viewer_quality", "viewer_id": client.id, "quality": quality})
+    else:
+        logger.warning("[%s] unknown message type '%s' dropped", client.tag, kind)
+
+
+async def run_session(websocket: WebSocket, role: Role, settings: Settings, hub: Hub) -> None:
+    ip = websocket.client.host if websocket.client else "unknown"
+    if not origin_allowed(websocket.headers.get("origin"), settings.hostname):
+        logger.warning("[%s] rejected origin %r from %s", role, websocket.headers.get("origin"), ip)
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Origin not allowed")
         return
 
     await websocket.accept()
-    client_id = await perform_auth_handshake(websocket, settings.publisher_key, "publisher", client_ip)
-    if not client_id:
+    expected_key = settings.publisher_key if role == "publisher" else settings.viewer_key
+    client_id = await authenticate(websocket, expected_key, role, ip)
+    if client_id is None:
         return
 
-    client = Client(websocket=websocket, role="publisher", id=client_id, ip=client_ip)
-    old_pub = await hub.set_publisher(client)
-    if old_pub is not None:
+    client = Client(socket=websocket, role=role, id=client_id, ip=ip)
+    if role == "publisher":
+        await hub.attach_publisher(client)
+    elif not await hub.attach_viewer(client):
+        await client.send({"type": "error", "reason": "too_many_viewers"})
+        await client.close(CLOSE_TOO_MANY_VIEWERS, "Viewer limit reached")
+        return
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            client.touch()
+            message = parse_message(raw)
+            if message is None:
+                logger.warning("[%s] dropped an invalid or oversized message", client.tag)
+                continue
+            if role == "publisher":
+                await handle_publisher_message(hub, client, message)
+            else:
+                await handle_viewer_message(hub, client, message)
+    except WebSocketDisconnect as exc:
+        logger.info("[%s] disconnected (code %s)", client.tag, exc.code)
+    except RuntimeError:
+        pass  # socket was closed by the hub (replaced / heartbeat timeout)
+    except Exception as exc:
+        logger.warning("[%s] session error: %s", client.tag, exc)
+    finally:
+        if role == "publisher":
+            await hub.detach_publisher(client)
+        else:
+            await hub.detach_viewer(client)
+
+
+async def heartbeat_watchdog(hub: Hub) -> None:
+    """Close sockets that went silent and log a one-line summary every minute."""
+    last_stats = time.monotonic()
+    while True:
+        await asyncio.sleep(HEARTBEAT_CHECK_INTERVAL_SECONDS)
         try:
-            await old_pub.websocket.close(code=1000, reason="Replaced by new publisher session")
-        except Exception:
-            pass
+            for client in await hub.stale_clients(HEARTBEAT_TIMEOUT_SECONDS):
+                logger.warning("[%s] no heartbeat for %.0fs, closing", client.tag, HEARTBEAT_TIMEOUT_SECONDS)
+                await client.close(CLOSE_TIMEOUT, "Heartbeat timeout")
+            if time.monotonic() - last_stats >= STATS_LOG_INTERVAL_SECONDS:
+                health = await hub.health()
+                logger.info(
+                    "[stats] publisher=%s viewers=%s relayed=%d",
+                    "online" if health["publisher"] else "offline",
+                    health["viewers"],
+                    hub.relayed_messages,
+                )
+                last_stats = time.monotonic()
+        except Exception as exc:  # never let the watchdog die
+            logger.error("watchdog error: %s", exc)
 
-    try:
-        while True:
-            raw_msg = await websocket.receive_text()
-            client.touch()
 
-            if len(raw_msg.encode("utf-8")) > MAX_MESSAGE_BYTES:
-                logger.warning("[%s:%s] Dropped message: payload exceeded 64 KB", client.role, client.id)
-                continue
+# ---------------------------------------------------------------- app factory
 
+
+def create_app(settings: Settings) -> FastAPI:
+    hub = Hub(max_viewers=settings.max_viewers)
+    templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        logger.info("Petcam starting: hostname=%s max_viewers=%d stun=%s port=%d",
+                    settings.hostname, settings.max_viewers, settings.stun_enabled, settings.port)
+        watchdog = asyncio.create_task(heartbeat_watchdog(hub))
+        try:
+            yield
+        finally:
+            watchdog.cancel()
             try:
-                msg = json.loads(raw_msg)
-            except json.JSONDecodeError:
-                logger.warning("[%s:%s] Dropped invalid JSON message", client.role, client.id)
-                continue
+                await watchdog
+            except asyncio.CancelledError:
+                pass
+            logger.info("Petcam stopped")
 
-            if not isinstance(msg, dict) or "type" not in msg:
-                logger.warning("[%s:%s] Dropped message without 'type'", client.role, client.id)
-                continue
+    app = FastAPI(title="Petcam", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.settings = settings
+    app.state.hub = hub
+    app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
-            msg_type = msg["type"]
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next: Any) -> Response:
+        response: Response = await call_next(request)
+        for name, value in SECURITY_HEADERS.items():
+            response.headers[name] = value
+        return response
 
-            if msg_type == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
-            elif msg_type == "offer":
-                # publisher -> server: {type: "offer", viewer_id, sdp}
-                viewer_id = str(msg.get("viewer_id", ""))
-                sdp = msg.get("sdp")
-                if not viewer_id or not sdp:
-                    logger.warning("[%s:%s] Offer missing viewer_id or sdp", client.role, client.id)
-                    continue
-                await hub.forward_to_viewer(viewer_id, {"type": "offer", "sdp": sdp}, client)
-            elif msg_type == "ice":
-                # publisher -> server: {type: "ice", viewer_id, candidate}
-                viewer_id = str(msg.get("viewer_id", ""))
-                candidate = msg.get("candidate")
-                if not viewer_id:
-                    logger.warning("[%s:%s] ICE candidate missing viewer_id", client.role, client.id)
-                    continue
-                await hub.forward_to_viewer(viewer_id, {"type": "ice", "candidate": candidate}, client)
-            else:
-                logger.warning("[%s:%s] Unknown message type: '%s'", client.role, client.id, msg_type)
+    @app.get("/")
+    async def root() -> RedirectResponse:
+        return RedirectResponse(url="/watch", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
-    except WebSocketDisconnect:
-        logger.info("[%s:%s] WebSocket disconnected", client.role, client.id)
-    except Exception as e:
-        logger.warning("[%s:%s] WebSocket exception: %s", client.role, client.id, e)
-    finally:
-        await hub.remove_publisher(client)
+    @app.get("/cam", response_class=HTMLResponse)
+    async def cam_page(request: Request) -> Response:
+        return templates.TemplateResponse(request, "cam.html")
+
+    @app.get("/watch", response_class=HTMLResponse)
+    async def watch_page(request: Request) -> Response:
+        return templates.TemplateResponse(request, "watch.html")
+
+    @app.get("/setup", response_class=HTMLResponse)
+    async def setup_page(request: Request) -> Response:
+        # This page shows both secret keys, so it is only served to a browser
+        # running on the server itself (http://127.0.0.1:<port>/setup).
+        if not is_local_request(request):
+            logger.warning("refused /setup from %s", request.client.host if request.client else "?")
+            return templates.TemplateResponse(request, "setup_denied.html", {"port": settings.port},
+                                              status_code=status.HTTP_403_FORBIDDEN)
+        return templates.TemplateResponse(request, "setup.html", pairing_context(settings))
+
+    @app.get("/healthz")
+    async def healthz() -> JSONResponse:
+        return JSONResponse(await hub.health())
+
+    @app.get("/config.json")
+    async def client_config() -> JSONResponse:
+        return JSONResponse({"stun_enabled": settings.stun_enabled, "ice_servers": settings.ice_servers()})
+
+    @app.get("/qr/watch.svg")
+    async def watch_qr(request: Request) -> Response:
+        # Lets a phone that already knows the viewer key show a QR code for
+        # another phone. The key must be presented, so nothing leaks.
+        presented = request.headers.get("x-petcam-key", "")
+        if not hmac.compare_digest(presented.encode("utf-8"), settings.viewer_key.encode("utf-8")):
+            return Response(status_code=status.HTTP_401_UNAUTHORIZED)
+        return Response(qr_svg(settings.watch_pairing_url), media_type="image/svg+xml")
+
+    @app.websocket("/ws/publisher")
+    async def publisher_socket(websocket: WebSocket) -> None:
+        await run_session(websocket, "publisher", settings, hub)
+
+    @app.websocket("/ws/viewer")
+    async def viewer_socket(websocket: WebSocket) -> None:
+        await run_session(websocket, "viewer", settings, hub)
+
+    return app
 
 
-@app.websocket("/ws/viewer")
-async def viewer_websocket_endpoint(websocket: WebSocket) -> None:
-    client_ip = websocket.client.host if websocket.client else "unknown"
-    if not verify_ws_origin(websocket, settings.hostname):
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Origin disallowed")
-        return
+def pairing_context(settings: Settings) -> dict[str, str]:
+    """Template variables for the pairing page (also used by setup.py)."""
+    return {
+        "hostname": settings.hostname,
+        "cam_url": settings.cam_pairing_url,
+        "watch_url": settings.watch_pairing_url,
+        "cam_qr_svg": qr_svg(settings.cam_pairing_url),
+        "watch_qr_svg": qr_svg(settings.watch_pairing_url),
+    }
 
-    await websocket.accept()
-    client_id = await perform_auth_handshake(websocket, settings.viewer_key, "viewer", client_ip)
-    if not client_id:
-        return
 
-    client = Client(websocket=websocket, role="viewer", id=client_id, ip=client_ip)
-    accepted = await hub.add_viewer(client)
-    if not accepted:
-        await websocket.send_text(json.dumps({"type": "error", "reason": "too_many_viewers"}))
-        await websocket.close(code=4409, reason="Viewer capacity reached")
-        return
-
+def _load_settings_or_exit() -> Settings:
     try:
-        while True:
-            raw_msg = await websocket.receive_text()
-            client.touch()
+        return load_settings()
+    except ConfigError as exc:
+        logger.error("Configuration error: %s", exc)
+        sys.exit(1)
 
-            if len(raw_msg.encode("utf-8")) > MAX_MESSAGE_BYTES:
-                logger.warning("[%s:%s] Dropped message: payload exceeded 64 KB", client.role, client.id)
-                continue
 
-            try:
-                msg = json.loads(raw_msg)
-            except json.JSONDecodeError:
-                logger.warning("[%s:%s] Dropped invalid JSON message", client.role, client.id)
-                continue
-
-            if not isinstance(msg, dict) or "type" not in msg:
-                logger.warning("[%s:%s] Dropped message without 'type'", client.role, client.id)
-                continue
-
-            msg_type = msg["type"]
-
-            if msg_type == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
-            elif msg_type == "join":
-                # Forward viewer_joined to publisher, and inform viewer of current publisher status
-                is_pub_online = hub.publisher is not None
-                await websocket.send_text(
-                    json.dumps({"type": "publisher_online" if is_pub_online else "publisher_offline"})
-                )
-                if is_pub_online:
-                    await hub.forward_to_publisher({"type": "viewer_joined", "viewer_id": client.id}, client)
-            elif msg_type == "answer":
-                # viewer -> server: {type: "answer", sdp}
-                sdp = msg.get("sdp")
-                if not sdp:
-                    logger.warning("[%s:%s] Answer missing sdp", client.role, client.id)
-                    continue
-                await hub.forward_to_publisher({"type": "answer", "viewer_id": client.id, "sdp": sdp}, client)
-            elif msg_type == "ice":
-                # viewer -> server: {type: "ice", candidate}
-                candidate = msg.get("candidate")
-                await hub.forward_to_publisher(
-                    {"type": "ice", "viewer_id": client.id, "candidate": candidate}, client
-                )
-            elif msg_type == "restart":
-                # viewer requests ICE restart
-                await hub.forward_to_publisher({"type": "viewer_restart", "viewer_id": client.id}, client)
-            elif msg_type == "quality":
-                # viewer requests quality change (auto / high)
-                quality = msg.get("quality", "auto")
-                await hub.forward_to_publisher(
-                    {"type": "viewer_quality", "viewer_id": client.id, "quality": quality}, client
-                )
-            else:
-                logger.warning("[%s:%s] Unknown message type: '%s'", client.role, client.id, msg_type)
-
-    except WebSocketDisconnect:
-        logger.info("[%s:%s] Viewer disconnected", client.role, client.id)
-    except Exception as e:
-        logger.warning("[%s:%s] Viewer exception: %s", client.role, client.id, e)
-    finally:
-        await hub.remove_viewer(client)
+app = create_app(_load_settings_or_exit())

@@ -6,64 +6,48 @@
     <meta name="theme-color" content="#0b0f19" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <title>Petcam — Live Watch</title>
+    <meta name="apple-mobile-web-app-title" content="Petcam" />
+    <title>Petcam Live</title>
+    <link rel="icon" href="/static/icon-192.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/static/icon-192.svg" />
     <link rel="manifest" href="/static/manifest.webmanifest" />
     <link rel="stylesheet" href="/static/css/styles.css" />
   </head>
   <body class="role-watch">
     <div class="app-container">
-      <!-- Top header bar with status dot, title, and key management -->
       <header class="header-bar">
         <div class="brand">
           <span class="status-indicator" id="status-dot"></span>
           <span class="title">Petcam Live</span>
         </div>
         <div class="header-actions">
-          <button id="share-qr-btn" class="btn btn-secondary btn-sm" title="Show QR code to let another phone watch">Share QR</button>
-          <button id="forget-key-btn" class="btn-text btn-sm" title="Clear stored viewer key">Forget Key</button>
+          <button id="share-qr-btn" class="btn btn-secondary btn-sm">Share QR</button>
+          <button id="forget-key-btn" class="btn-text btn-sm">Forget key</button>
         </div>
       </header>
 
-      <!-- Main Stage -->
       <main class="main-stage">
         <div class="video-container" id="video-wrapper">
-          <!-- Full-width incoming video element (autoplay, playsinline, muted initially for Chrome/Android) -->
-          <video
-            id="remote-video"
-            class="video-element"
-            autoplay
-            playsinline
-            muted
-            webkit-playsinline
-          ></video>
+          <!-- muted at first: Chrome and Safari block unmuted autoplay. The Unmute button is the user gesture. -->
+          <video id="remote-video" class="video-element" autoplay playsinline muted webkit-playsinline></video>
 
-          <!-- Centered "Camera is offline" overlay -->
           <div id="offline-banner" class="center-banner hidden">
             <div class="center-banner-icon">📹</div>
             <h2 class="center-banner-title">Camera is offline</h2>
-            <p class="center-banner-desc">Waiting for the iPad publisher to connect. Reconnection will happen automatically.</p>
+            <p class="center-banner-desc">Waiting for the iPad to connect. This page reconnects by itself.</p>
           </div>
 
-          <!-- Tap to Play Banner if browser autoplay policy blocks playback -->
-          <div id="play-overlay" class="center-banner hidden" style="cursor: pointer; z-index: 15;">
+          <div id="play-overlay" class="center-banner tappable hidden">
             <div class="center-banner-icon">▶️</div>
-            <h2 class="center-banner-title">Tap to Start Video</h2>
-            <p class="center-banner-desc">Browser autoplay paused. Tap screen to resume live video.</p>
+            <h2 class="center-banner-title">Tap to play</h2>
+            <p class="center-banner-desc">The browser paused playback. Tap to resume.</p>
           </div>
 
-          <!-- Auth Key Prompt Card (if not in localStorage) -->
           <div id="key-card" class="overlay-card hidden">
-            <h2 class="card-heading">Viewer Authentication</h2>
-            <p class="card-subtext">Enter the 32-character viewer key to watch the live dog stream.</p>
+            <h2 class="card-heading">Viewer key</h2>
+            <p class="card-subtext">Scan the phone QR code from the pairing page, or paste the viewer key from config.toml.</p>
             <div class="form-row">
-              <input
-                type="password"
-                id="key-input"
-                class="input-text"
-                placeholder="Paste 32-character viewer key"
-                autocomplete="off"
-                spellcheck="false"
-              />
+              <input type="password" id="key-input" class="input-text" placeholder="Viewer key (32+ characters)" autocomplete="off" spellcheck="false" />
               <button id="save-key-btn" class="btn btn-primary">Connect</button>
             </div>
             <div id="auth-error-msg" class="banner banner-error hidden"></div>
@@ -71,63 +55,45 @@
         </div>
       </main>
 
-      <!-- Bottom controls bar (mute/unmute, quality toggle, reconnect) -->
       <div class="controls-bar">
-        <button id="audio-toggle-btn" class="btn btn-control" aria-label="Audio Muted. Click to Unmute">
-          <span id="audio-icon">🔇</span>
-          <span id="audio-text">Unmute</span>
+        <button id="audio-toggle-btn" class="btn btn-control" aria-label="Unmute audio">
+          <span id="audio-icon">🔇</span><span id="audio-text">Unmute</span>
         </button>
-
-        <button id="quality-toggle-btn" class="btn btn-control" aria-label="Toggle streaming quality mode">
-          <span class="control-tag">Quality:</span>
-          <strong id="quality-mode-text">Auto (800k)</strong>
+        <button id="quality-toggle-btn" class="btn btn-control" aria-label="Toggle stream quality">
+          <span class="control-tag">Quality</span><strong id="quality-mode-text">Auto</strong>
         </button>
-
-        <button id="reconnect-btn" class="btn btn-control" aria-label="Reconnect WebRTC stream">
-          <span>🔄</span>
-          <span>Reconnect</span>
+        <button id="reconnect-btn" class="btn btn-control" aria-label="Reconnect">
+          <span>🔄</span><span>Reconnect</span>
         </button>
       </div>
 
-      <!-- One-line status strip (Long press opens diagnostic logs) -->
-      <footer id="status-strip" class="status-strip" title="Long press for internal diagnostic log">
-        <div class="status-col">
-          <span class="label">State:</span>
-          <strong id="conn-state" class="val val-connecting">Connecting...</strong>
-        </div>
-        <div class="status-col">
-          <span class="label">ICE:</span>
-          <span id="ice-state" class="val val-sub">new</span>
-        </div>
-        <div class="status-col">
-          <span class="label">Feed:</span>
-          <span id="feed-stats" class="val val-sub">0x0 @ 0fps</span>
-        </div>
+      <footer id="status-strip" class="status-strip" title="Long press for the diagnostic log">
+        <div class="status-col"><span class="label">State</span> <strong id="conn-state" class="val val-connecting">Connecting</strong></div>
+        <div class="status-col"><span class="label">ICE</span> <span id="ice-state" class="val val-sub">new</span></div>
+        <div class="status-col"><span class="label">Feed</span> <span id="feed-stats" class="val val-sub">–</span></div>
       </footer>
     </div>
 
-    <!-- Hidden Log Drawer (Triggered by long-pressing status strip) -->
-    <div id="log-modal" class="log-modal hidden" role="dialog" aria-modal="true" aria-label="Diagnostic Log">
+    <div id="log-modal" class="log-modal hidden" role="dialog" aria-modal="true" aria-label="Diagnostic log">
       <div class="log-modal-content">
         <div class="log-modal-header">
-          <h3>Diagnostic Event Log</h3>
-          <button id="close-log-btn" class="btn btn-sm">Close</button>
+          <h3>Diagnostic log</h3>
+          <button id="close-log-btn" class="btn btn-secondary btn-sm">Close</button>
         </div>
         <div id="log-entries" class="log-entries"></div>
       </div>
     </div>
 
-    <!-- Share QR Code Modal -->
-    <div id="qr-modal" class="log-modal hidden" role="dialog" aria-modal="true" aria-label="Share Stream QR Code">
+    <div id="qr-modal" class="log-modal hidden" role="dialog" aria-modal="true" aria-label="Share viewer QR code">
       <div class="log-modal-content qr-modal-box">
         <div class="log-modal-header">
-          <h3>Scan to Watch Live</h3>
-          <button id="close-qr-btn" class="btn btn-sm">Close</button>
+          <h3>Let another phone watch</h3>
+          <button id="close-qr-btn" class="btn btn-secondary btn-sm">Close</button>
         </div>
         <div class="qr-modal-body">
-          <p class="qr-instructions">Scan this code with a second phone or tablet camera to start watching instantly:</p>
+          <p class="qr-instructions">Scan this with the other phone's camera. It must be signed in to the same Tailscale account.</p>
           <div id="qr-code-display" class="qr-code-display"></div>
-          <p id="qr-link-copy" class="qr-link-copy" title="Click to copy pairing link"></p>
+          <p id="qr-link-copy" class="qr-link-copy"></p>
         </div>
       </div>
     </div>

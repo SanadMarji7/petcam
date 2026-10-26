@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""
-Petcam Interactive Setup Assistant & QR Code Generator
-Automates configuration, generates cryptographic keys, detects Tailscale MagicDNS,
-and displays instant scannable QR codes both in your terminal and via an HTML pairing page.
+"""Petcam setup assistant.
+
+Creates config.toml with fresh random keys (or keeps the existing ones),
+fills in the server's Tailscale MagicDNS name, prints scannable QR codes in
+the terminal and writes pairing.html with the same codes for a browser.
+
+Usage:  python3 setup.py            (inside the project venv)
 """
 from __future__ import annotations
 
@@ -14,425 +17,160 @@ import sys
 import webbrowser
 from pathlib import Path
 
-try:
-    import qrcode  # type: ignore[import-not-found]
-    HAS_QRCODE_PKG = True
-except ImportError:
-    HAS_QRCODE_PKG = False
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+from config import (
+    BASE_DIR,
+    DEFAULT_CONFIG_PATH,
+    ConfigError,
+    Settings,
+    load_settings,
+    normalize_hostname,
+    render_config,
+)
+from qrgen import matrix_to_terminal, qr_matrix, qr_svg
+
+PLACEHOLDER_HOST = "dogcam.your-tailnet.ts.net"
+PAIRING_FILE = BASE_DIR / "pairing.html"
+
+BOLD = "\033[1m"
+GREEN = "\033[1;32m"
+YELLOW = "\033[1;33m"
+RED = "\033[1;31m"
+CYAN = "\033[1;36m"
+DIM = "\033[90m"
+RESET = "\033[0m"
 
 
-def print_banner() -> None:
-    print("\033[1;36m")
-    print("=" * 64)
-    print("   🐶  PETCAM — SELF-HOSTED WEBRTC DOG MONITOR SETUP WIZARD  🐶")
-    print("=" * 64)
-    print("\033[0m")
-
-
-def get_tailscale_info() -> tuple[str | None, str | None, str]:
-    """
-    Queries tailscale status to detect the machine's true MagicDNS domain and Tailscale IP.
-    Returns (magicdns_name, tailscale_ip, status_message).
-    """
+def tailscale_hostname() -> tuple[str | None, str]:
+    """(MagicDNS name, status message) from `tailscale status --json`."""
     try:
-        output = subprocess.check_output(["tailscale", "status", "--json"], text=True, stderr=subprocess.DEVNULL)
-        data = json.loads(output)
-        backend_state = data.get("BackendState", "")
-
-        if backend_state != "Running":
-            return (None, None, f"Tailscale state is '{backend_state}'. Please run 'sudo tailscale up'.")
-
-        # Check for explicitly assigned certificate domains
-        cert_domains = data.get("CertDomains", [])
-        if cert_domains and cert_domains[0]:
-            return (cert_domains[0], None, "OK")
-
-        self_node = data.get("Self", {})
-        dns_name = self_node.get("DNSName", "").rstrip(".")
-        ips = self_node.get("TailscaleIPs", [])
-        ipv4 = ips[0] if ips else None
-
-        if dns_name:
-            return (dns_name, ipv4, "OK")
-        if ipv4:
-            return (None, ipv4, f"Tailscale connected (IP {ipv4}), but MagicDNS domain name is pending.")
+        raw = subprocess.check_output(["tailscale", "status", "--json"], text=True, stderr=subprocess.DEVNULL, timeout=10)
     except FileNotFoundError:
-        return (None, None, "Tailscale CLI is not installed. Install via: curl -fsSL https://tailscale.com/install.sh | sh")
-    except Exception as e:
-        return (None, None, f"Could not query Tailscale: {e}")
+        return None, "Tailscale CLI not found. Install it: curl -fsSL https://tailscale.com/install.sh | sh"
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return None, f"Could not query Tailscale ({exc}). Is tailscaled running?"
 
-    return (None, None, "Tailscale is not running. Run: sudo tailscale up")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "Unexpected output from 'tailscale status --json'"
 
+    state = data.get("BackendState")
+    if state != "Running":
+        return None, f"Tailscale is '{state}'. Run: sudo tailscale up"
 
-def render_terminal_half_blocks(matrix: list[list[bool]], border: int = 2) -> None:
-    """
-    Renders QR code in terminal using Unicode half-block characters (▀, ▄, █, ' ').
-    Each character cell encodes two vertical QR modules, ensuring an exact 1:1 square
-    module aspect ratio that smartphone camera apps can easily focus on and scan.
-    """
-    h = len(matrix)
-    w = len(matrix[0])
-    padded_w = w + (border * 2)
-
-    # ANSI codes: 47 = White Background, 30 = Black Foreground
-    colors = "\033[47;30m"
-    reset = "\033[0m"
-
-    # Top quiet zone border
-    for _ in range((border + 1) // 2):
-        print(colors + " " * padded_w + reset)
-
-    # Render pairs of rows
-    for y in range(0, h, 2):
-        top_row = matrix[y]
-        bot_row = matrix[y + 1] if y + 1 < h else [False] * w
-
-        row_str = [colors, " " * border]  # left quiet zone
-        for x in range(w):
-            top = top_row[x]
-            bot = bot_row[x]
-            if top and bot:
-                row_str.append("█")  # both black
-            elif top and not bot:
-                row_str.append("▀")  # top black, bottom white
-            elif not top and bot:
-                row_str.append("▄")  # top white, bottom black
-            else:
-                row_str.append(" ")  # both white
-        row_str.append(" " * border)  # right quiet zone
-        row_str.append(reset)
-        print("".join(row_str))
-
-    # Bottom quiet zone border
-    for _ in range((border + 1) // 2):
-        print(colors + " " * padded_w + reset)
+    cert_domains = data.get("CertDomains") or []
+    if cert_domains and cert_domains[0]:
+        return str(cert_domains[0]).rstrip("."), "ok"
+    dns_name = str((data.get("Self") or {}).get("DNSName") or "").rstrip(".")
+    if dns_name:
+        return dns_name, "ok (enable HTTPS certificates in the Tailscale admin console if not done yet)"
+    return None, "Tailscale is running but MagicDNS is off. Enable MagicDNS in the Tailscale admin console."
 
 
-def matrix_to_svg(matrix: list[list[bool]]) -> str:
-    """Converts a QR matrix to a sharp, standalone SVG string."""
-    size = len(matrix)
-    rects = []
-    for y, row in enumerate(matrix):
-        for x, val in enumerate(row):
-            if val:
-                rects.append(f'<rect x="{x}" y="{y}" width="1" height="1" fill="#000000"/>')
-    content = "".join(rects)
-    return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}" width="260" height="260" '
-        f'style="background:#fff;border-radius:12px;padding:12px;box-shadow:0 4px 16px rgba(0,0,0,0.3);">'
-        f'<rect width="{size}" height="{size}" fill="#ffffff"/>'
-        f"{content}"
-        f"</svg>"
+def existing_settings() -> Settings | None:
+    if not DEFAULT_CONFIG_PATH.exists():
+        return None
+    try:
+        return load_settings(DEFAULT_CONFIG_PATH)
+    except ConfigError as exc:
+        print(f"{YELLOW}[!] Existing config.toml is not usable: {exc}{RESET}")
+        return None
+
+
+def write_config(settings: Settings) -> None:
+    DEFAULT_CONFIG_PATH.write_text(render_config(settings), encoding="utf-8")
+    try:
+        os.chmod(DEFAULT_CONFIG_PATH, 0o600)  # keys are secrets
+    except OSError:
+        pass
+
+
+def write_pairing_html(settings: Settings) -> Path:
+    env = Environment(loader=FileSystemLoader(str(BASE_DIR / "templates")), autoescape=select_autoescape(["html"]))
+    html = env.get_template("setup.html").render(
+        hostname=settings.hostname,
+        cam_url=settings.cam_pairing_url,
+        watch_url=settings.watch_pairing_url,
+        cam_qr_svg=qr_svg(settings.cam_pairing_url),
+        watch_qr_svg=qr_svg(settings.watch_pairing_url),
     )
+    PAIRING_FILE.write_text(html, encoding="utf-8")
+    try:
+        os.chmod(PAIRING_FILE, 0o600)
+    except OSError:
+        pass
+    return PAIRING_FILE
 
 
-def create_standalone_pairing_html(
-    hostname: str,
-    cam_url: str,
-    watch_url: str,
-    cam_svg: str,
-    watch_svg: str,
-) -> Path:
-    """Generates a clean local HTML pairing guide with embedded SVG QR codes."""
-    html_content = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Petcam Pairing Guide</title>
-  <style>
-    body {{
-      background: #0b0f19;
-      color: #f1f5f9;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      margin: 0;
-      padding: 32px 16px;
-      display: flex;
-      justify-content: center;
-    }}
-    .container {{
-      max-width: 860px;
-      width: 100%;
-    }}
-    h1 {{
-      text-align: center;
-      margin-bottom: 8px;
-    }}
-    .sub {{
-      text-align: center;
-      color: #94a3b8;
-      font-size: 14px;
-      margin-bottom: 32px;
-    }}
-    .grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-      gap: 24px;
-    }}
-    .card {{
-      background: #131b2e;
-      border: 1px solid #2d3b5d;
-      border-radius: 16px;
-      padding: 24px;
-      text-align: center;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-    }}
-    .tag {{
-      font-size: 11px;
-      font-weight: 700;
-      text-transform: uppercase;
-      padding: 4px 10px;
-      border-radius: 20px;
-      margin-bottom: 12px;
-    }}
-    .tag-cam {{ background: rgba(59,130,246,0.2); color: #60a5fa; border: 1px solid rgba(59,130,246,0.4); }}
-    .tag-watch {{ background: rgba(16,185,129,0.2); color: #34d399; border: 1px solid rgba(16,185,129,0.4); }}
-    .qr-wrap {{
-      margin: 16px 0;
-      background: #fff;
-      padding: 8px;
-      border-radius: 16px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }}
-    .link-box {{
-      font-family: monospace;
-      font-size: 11px;
-      background: #070b12;
-      border: 1px solid #1e293b;
-      padding: 10px;
-      border-radius: 8px;
-      word-break: break-all;
-      width: 90%;
-      color: #38bdf8;
-      cursor: pointer;
-    }}
-    .instructions {{
-      font-size: 13px;
-      color: #94a3b8;
-      line-height: 1.5;
-      margin-top: 8px;
-    }}
-    .checklist {{
-      margin-top: 32px;
-      background: #131b2e;
-      border: 1px solid #2d3b5d;
-      border-radius: 16px;
-      padding: 24px;
-    }}
-    .checklist h3 {{ margin-top: 0; }}
-    .checklist ul {{
-      padding-left: 20px;
-      color: #cbd5e1;
-      font-size: 13px;
-      line-height: 1.6;
-    }}
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>🐶 Petcam Pairing Guide</h1>
-    <p class="sub">Point your camera at the QR code on this screen to pair your devices instantly with zero typing.</p>
+def main() -> int:
+    print(f"{CYAN}{'=' * 64}\n   🐶  Petcam setup\n{'=' * 64}{RESET}")
 
-    <div class="grid">
-      <!-- iPad -->
-      <div class="card">
-        <span class="tag tag-cam">1. iPad Camera Stream</span>
-        <h2>Scan with iPad</h2>
-        <div class="qr-wrap">{cam_svg}</div>
-        <div class="link-box" onclick="navigator.clipboard.writeText('{cam_url}'); alert('Copied iPad Link!');">
-          {cam_url}
-        </div>
-        <p class="instructions">
-          1. Aim default iPad camera at this QR code.<br>
-          2. Tap the yellow Safari notification.<br>
-          3. Tap <strong>Start Camera</strong> and engage <strong>Guided Access</strong>.
-        </p>
-      </div>
-
-      <!-- Pixel -->
-      <div class="card">
-        <span class="tag tag-watch">2. Pixel / Phone Watch</span>
-        <h2>Scan with Phone</h2>
-        <div class="qr-wrap">{watch_svg}</div>
-        <div class="link-box" onclick="navigator.clipboard.writeText('{watch_url}'); alert('Copied Viewer Link!');">
-          {watch_url}
-        </div>
-        <p class="instructions">
-          1. Aim phone camera at this QR code.<br>
-          2. Tap the notification to watch live.<br>
-          3. In Chrome, tap <strong>&quot;Add to Home screen&quot;</strong> for full-screen.
-        </p>
-      </div>
-    </div>
-
-    <div class="checklist">
-      <h3>iPad Unattended Checklist (Crucial for 24/7 Running):</h3>
-      <ul>
-        <li><strong>Wall Power:</strong> Keep iPad plugged into charger on a stand.</li>
-        <li><strong>Auto-Lock to Never:</strong> iOS Settings &rarr; Display &rarr; Auto-Lock &rarr; Never.</li>
-        <li><strong>Guided Access:</strong> iOS Settings &rarr; Accessibility &rarr; Guided Access &rarr; On. Tap Start Camera, then triple-click side button to lock Safari in place.</li>
-        <li><strong>Screen Off Mode:</strong> Tap &quot;Screen Off&quot; to keep screen black while streaming continues.</li>
-      </ul>
-    </div>
-  </div>
-</body>
-</html>
-"""
-    pairing_file = Path("pairing.html")
-    with open(pairing_file, "w", encoding="utf-8") as f:
-        f.write(html_content)
-    return pairing_file
-
-
-def main() -> None:
-    print_banner()
-
-    config_path = Path("config.toml")
-    real_host, ts_ip, ts_msg = get_tailscale_info()
-
-    if real_host:
-        print(f"\033[1;32m[✓] Tailscale active:\033[0m Found domain \033[1;36m{real_host}\033[0m")
+    host, status = tailscale_hostname()
+    if host:
+        print(f"{GREEN}[✓] Tailscale name: {host}{RESET}  {DIM}{status}{RESET}")
     else:
-        print(f"\033[1;33m[!] Tailscale status:\033[0m {ts_msg}")
+        print(f"{YELLOW}[!] Tailscale: {status}{RESET}")
 
-    hostname = real_host or "dogcam.your-tailnet.ts.net"
-    publisher_key = ""
-    viewer_key = ""
-
-    if config_path.exists():
-        print("\033[1;32m[✓] Existing config.toml found.\033[0m Loading configuration...")
-        import config
-        try:
-            settings = config.load_settings()
-            hostname = settings.hostname
-            publisher_key = settings.publisher_key
-            viewer_key = settings.viewer_key
-
-            # If existing config has a placeholder and we found a real Tailscale domain, auto-update!
-            if ("your-tailnet" in hostname or hostname.startswith("dogcam.")) and real_host:
-                print(f"\033[1;33m[*] Upgrading placeholder hostname to your real Tailscale domain: {real_host}\033[0m")
-                hostname = real_host
-                # Rewrite config.toml with real domain
-                config_content = f"""# Petcam configuration file
-# Updated with real Tailscale domain by setup.py
-
-hostname = "{hostname}"
-publisher_key = "{publisher_key}"
-viewer_key = "{viewer_key}"
-max_viewers = 4
-stun_enabled = true
-port = 8000
-"""
-                with open(config_path, "w", encoding="utf-8") as f:
-                    f.write(config_content)
-        except Exception as e:
-            print(f"\033[1;31m[!] Error parsing config.toml: {e}\033[0m")
-            return
+    current = existing_settings()
+    if current is not None:
+        print(f"{GREEN}[✓] Keeping the keys from config.toml{RESET}")
+        publisher_key, viewer_key = current.publisher_key, current.viewer_key
+        max_viewers, stun_enabled, port = current.max_viewers, current.stun_enabled, current.port
+        hostname = current.hostname
     else:
-        print("\033[1;33m[*] Creating new config.toml with auto-generated secure keys...\033[0m")
-        publisher_key = secrets.token_urlsafe(32)
-        viewer_key = secrets.token_urlsafe(32)
+        print(f"{YELLOW}[*] Creating config.toml with new random keys{RESET}")
+        publisher_key, viewer_key = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+        max_viewers, stun_enabled, port = 4, True, 8000
+        hostname = PLACEHOLDER_HOST
 
-        config_content = f"""# Petcam configuration file
-# Auto-generated by setup.py
+    if host and host != hostname:
+        print(f"{YELLOW}[*] Setting hostname to {host}{RESET}")
+        hostname = host
+    elif not host and PLACEHOLDER_HOST in hostname:
+        typed = input("Tailscale name of this server (e.g. dogcam.tail1234.ts.net), or Enter to skip: ").strip()
+        if typed:
+            hostname = normalize_hostname(typed)
 
-# Tailscale MagicDNS hostname
-hostname = "{hostname}"
+    settings = Settings(
+        hostname=hostname,
+        publisher_key=publisher_key,
+        viewer_key=viewer_key,
+        max_viewers=max_viewers,
+        stun_enabled=stun_enabled,
+        port=port,
+    )
+    write_config(settings)
+    print(f"{GREEN}[✓] Saved {DEFAULT_CONFIG_PATH}{RESET}")
 
-# Secret keys (32+ characters)
-publisher_key = "{publisher_key}"
-viewer_key = "{viewer_key}"
+    if PLACEHOLDER_HOST in settings.hostname:
+        print(f"\n{RED}The hostname is still a placeholder, so the QR codes below will not open on your devices.")
+        print(f"Run 'sudo tailscale up', enable MagicDNS + HTTPS in the Tailscale admin console, then run setup.py again.{RESET}\n")
+        return 1
 
-# Settings
-max_viewers = 4
-stun_enabled = true
-port = 8000
-"""
-        with open(config_path, "w", encoding="utf-8") as f:
-            f.write(config_content)
-        print(f"\033[1;32m[✓] Saved {config_path}\033[0m")
-
-    # Warn if hostname is still a placeholder
-    if "your-tailnet" in hostname:
-        print("\n\033[1;31m" + "!" * 64)
-        print("ATTENTION: Hostname is currently set to placeholder 'dogcam.your-tailnet.ts.net'.")
-        print("Your iPad/phone will report 'server can't be found' until Tailscale is running!")
-        print("Run 'sudo tailscale up' on Fedora, then re-run setup.py.")
-        print("!" * 64 + "\033[0m\n")
-
-    cam_pairing_url = f"https://{hostname}/cam#key={publisher_key}"
-    watch_pairing_url = f"https://{hostname}/watch#key={viewer_key}"
-
-    # Generate QR codes
-    cam_matrix: list[list[bool]] = []
-    watch_matrix: list[list[bool]] = []
-
-    if HAS_QRCODE_PKG:
-        qr_cam = qrcode.QRCode(border=2)
-        qr_cam.add_data(cam_pairing_url)
-        qr_cam.make(fit=True)
-        cam_matrix = qr_cam.get_matrix()
-
-        qr_watch = qrcode.QRCode(border=2)
-        qr_watch.add_data(watch_pairing_url)
-        qr_watch.make(fit=True)
-        watch_matrix = qr_watch.get_matrix()
-
-    # Create standalone pairing.html
-    cam_svg = matrix_to_svg(cam_matrix) if cam_matrix else f"<code>{cam_pairing_url}</code>"
-    watch_svg = matrix_to_svg(watch_matrix) if watch_matrix else f"<code>{watch_pairing_url}</code>"
-
-    pairing_file = create_standalone_pairing_html(hostname, cam_pairing_url, watch_pairing_url, cam_svg, watch_svg)
-    full_pairing_path = pairing_file.resolve()
-
-    print("\n" + "=" * 64)
-    print("\033[1;37m🚀 EASIEST WAY TO PAIR: OPEN THE VISUAL GUIDE IN YOUR BROWSER\033[0m")
-    print("=" * 64)
-    print("A crisp, high-resolution pairing page has been created:")
-    print(f"\033[1;32m👉 file://{full_pairing_path}\033[0m")
-    print("\033[90m(Open this file in Firefox/Chrome or run 'xdg-open pairing.html' for 100% crystal-clear QR codes)\033[0m\n")
-
-    # Attempt to open pairing.html automatically if in desktop environment
+    pairing = write_pairing_html(settings)
+    print(f"\n{BOLD}Pairing page with large QR codes:{RESET} {GREEN}file://{pairing}{RESET}")
     if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
         try:
-            webbrowser.open(f"file://{full_pairing_path}")
-            print("\033[1;32m[✓] Opened pairing.html in your default web browser.\033[0m\n")
+            webbrowser.open(pairing.as_uri())
         except Exception:
             pass
 
-    print("-" * 64)
-    print("\033[1;37mTERMINAL QR CODES (COMPACT & SCANNABLE):\033[0m")
-    print("-" * 64)
+    for label, url in (("1. iPad — scan with the Camera app, open /cam", settings.cam_pairing_url),
+                       ("2. Phone — scan with the camera, open /watch", settings.watch_pairing_url)):
+        print(f"\n{YELLOW}{label}{RESET}")
+        print(matrix_to_terminal(qr_matrix(url)))
+        print(f"{DIM}{url}{RESET}")
 
-    if cam_matrix:
-        print("\n\033[1;33m>>> 1. IPAD SETUP (Scan with iPad Camera App):\033[0m")
-        render_terminal_half_blocks(cam_matrix, border=2)
-        print(f"\033[1;34mLink:\033[0m {cam_pairing_url}")
-        print("→ Tap the yellow Safari notification to pair automatically.\n")
-
-    if watch_matrix:
-        print("\n\033[1;33m>>> 2. PIXEL / PHONE SETUP (Scan with Phone Camera):\033[0m")
-        render_terminal_half_blocks(watch_matrix, border=2)
-        print(f"\033[1;34mLink:\033[0m {watch_pairing_url}")
-        print("→ Tap the notification to watch live, then 'Add to Home screen'.\n")
-
-    if not HAS_QRCODE_PKG:
-        print("\033[1;33mTip:\033[0m For graphical QR codes in the terminal, run:")
-        print("  \033[1;32mpip install qrcode\033[0m\n")
-
-    print("=" * 64)
-    print("\033[1;36mNEXT STEPS:\033[0m")
-    print("1. Start Tailscale HTTPS proxy:")
-    print("   \033[1;32msudo tailscale serve --bg http://127.0.0.1:8000\033[0m")
-    print("2. Start the Petcam server:")
-    print("   \033[1;32muvicorn main:app --host 127.0.0.1 --port 8000\033[0m")
-    print("   (or enable service: sudo systemctl enable --now dogcam)")
-    print("=" * 64 + "\n")
+    print(f"\n{CYAN}Next steps{RESET}")
+    print(f"  1. HTTPS via Tailscale:  {GREEN}sudo tailscale serve --bg {settings.port}{RESET}")
+    print(f"  2. Start the server:     {GREEN}uvicorn main:app --host 127.0.0.1 --port {settings.port}{RESET}")
+    print(f"     or as a service:      {GREEN}sudo systemctl enable --now dogcam{RESET}")
+    print(f"  3. Check it:             {GREEN}curl https://{settings.hostname}/healthz{RESET}")
+    print(f"  Pairing page while the server runs: {GREEN}http://127.0.0.1:{settings.port}/setup{RESET} (on this machine only)\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

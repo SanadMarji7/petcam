@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Petcam Pairing</title>
+    <link rel="stylesheet" href="/static/css/styles.css" />
+  </head>
+  <body class="role-setup">
+    <div class="setup-denied">
+      <h1>Pairing page is local only</h1>
+      <p>This page shows both secret keys, so the server only serves it to a browser running on the server itself.</p>
+      <p>On the server open <code>http://127.0.0.1:{{ port }}/setup</code>, or run <code>python3 setup.py</code> in a terminal to print the QR codes there.</p>
+      <p>From another machine you can tunnel it with <code>ssh -L {{ port }}:127.0.0.1:{{ port }} user@server</code> and open the same address.</p>
+    </div>
+  </body>
+</html>

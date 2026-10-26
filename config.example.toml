@@ -1,21 +1,22 @@
-# Petcam configuration file
-# Copy this to config.toml and replace keys with random 32+ character tokens.
-# Generate keys with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+# Petcam configuration.
+# Easiest: run `python3 setup.py`, which writes config.toml for you.
+# Manual: copy this file to config.toml and fill in the three values below.
+# Generate a key with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 
-# Tailscale MagicDNS hostname for this server (used for Origin verification)
+# Tailscale MagicDNS name of this server. Browsers must open exactly this host;
+# the server rejects WebSocket connections from any other origin.
 hostname = "dogcam.your-tailnet.ts.net"
 
-# 32+ character secret key for the iPad publisher (/cam)
-publisher_key = "CHANGE_ME_TO_32_CHAR_RANDOM_PUBLISHER_KEY"
+# Secret pairing keys, at least 32 characters each and different from each other.
+publisher_key = "CHANGE_ME_TO_A_RANDOM_32_CHAR_PUBLISHER_KEY"
+viewer_key = "CHANGE_ME_TO_A_RANDOM_32_CHAR_VIEWER_KEY"
 
-# 32+ character secret key for viewers (/watch)
-viewer_key = "CHANGE_ME_TO_32_CHAR_RANDOM_VIEWER_KEY"
-
-# Maximum concurrent viewers allowed (default: 4)
+# How many phones/laptops may watch at the same time.
 max_viewers = 4
 
-# Fallback STUN server (resolves modern iOS/Android .local mDNS host candidate masking)
+# Also offer Google STUN to the browsers. Keep true unless you want media to
+# travel only over Tailscale IPs (then set false).
 stun_enabled = true
 
-# Internal port for Uvicorn (tailscale serve will proxy https to 127.0.0.1:port)
+# Local port for Uvicorn; `tailscale serve` forwards HTTPS to it.
 port = 8000

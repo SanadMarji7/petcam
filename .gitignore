@@ -1,23 +1,16 @@
-node_modules/
-build/
-dist/
-coverage/
-.DS_Store
-*.log
-.env*
-!.env.example
-
-# Test & Playwright artifacts
-.playwright-cli/
-.aistudio/
+# Secrets and generated pairing material
+config.toml
+pairing.html
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[co]
 venv/
 .venv/
-config.toml
-pairing.html
-cam_qr.svg
-watch_qr.svg
+.pytest_cache/
+
+# Editors / OS
+.DS_Store
+*.log
+.idea/
+.vscode/

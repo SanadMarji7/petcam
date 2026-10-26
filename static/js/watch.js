@@ -2,594 +2,560 @@
 'use strict';
 
 /**
- * Petcam Viewer Controller (Google Pixel & Mobile / Desktop Chrome optimized)
- * Features:
- * - One-click WebRTC watch stream with zero dependencies
- * - Candidate buffering before setRemoteDescription
- * - Audio unmuting gesture
- * - Resolution & FPS live metrics
- * - Watchdog self-healing on Wi-Fi/mobile network transitions
+ * Petcam viewer page (/watch) for a Pixel, iPhone or laptop.
+ *
+ * Flow: open WebSocket -> auth -> join -> wait for the publisher's offer ->
+ * answer -> live. Every offer carries a `session` id. A plain offer always
+ * starts a fresh RTCPeerConnection; an offer flagged `restart` is an ICE
+ * restart and is applied to the existing connection with the same session.
+ * The watchdog re-sends `join` when no offer arrives and rebuilds when media
+ * stalls, so the page recovers without anyone tapping it.
  */
-
 (function () {
-  const { log, SignalingClient, readVideoStats } = window.Petcam;
+  const P = window.Petcam;
+  const log = P.log;
 
-  // DOM Elements
-  const videoWrapper = document.getElementById('video-wrapper');
-  const remoteVideo = /** @type {HTMLVideoElement} */ (document.getElementById('remote-video'));
-  const keyCard = document.getElementById('key-card');
-  const keyInput = /** @type {HTMLInputElement} */ (document.getElementById('key-input'));
-  const saveKeyBtn = document.getElementById('save-key-btn');
-  const forgetKeyBtn = document.getElementById('forget-key-btn');
-  const authErrorMsg = document.getElementById('auth-error-msg');
-  const offlineBanner = document.getElementById('offline-banner');
-  const playOverlay = document.getElementById('play-overlay');
+  const KEY_STORAGE = 'petcam_viewer_key';
+  const DEVICE_STORAGE = 'petcam_device_id';
+  const WATCHDOG_INTERVAL_MS = 2000;
+  const OFFER_TIMEOUT_MS = 8000; // no offer after join -> join again
+  const CONNECT_TIMEOUT_MS = 20000; // answered but ICE never connected -> rebuild
+  const STUCK_RESTART_SECONDS = 8; // frames flat -> ask for ICE restart
+  const STUCK_REBUILD_SECONDS = 18; // still flat -> rebuild from a new offer
+  const ICE_DISCONNECT_GRACE_MS = 5000;
+  const MAX_FAILURES_BEFORE_BACKOFF = 3;
+  const BACKOFF_SECONDS = 30;
 
-  // Controls & Status Strip
-  const audioToggleBtn = document.getElementById('audio-toggle-btn');
-  const audioIcon = document.getElementById('audio-icon');
-  const audioText = document.getElementById('audio-text');
-  const qualityToggleBtn = document.getElementById('quality-toggle-btn');
-  const qualityModeText = document.getElementById('quality-mode-text');
-  const reconnectBtn = document.getElementById('reconnect-btn');
-
-  const statusDot = document.getElementById('status-dot');
-  const connStateEl = document.getElementById('conn-state');
-  const iceStateEl = document.getElementById('ice-state');
-  const feedStatsEl = document.getElementById('feed-stats');
+  // DOM
+  const $ = (id) => document.getElementById(id);
+  const videoWrapper = $('video-wrapper');
+  const remoteVideo = /** @type {HTMLVideoElement} */ ($('remote-video'));
+  const keyCard = $('key-card');
+  const keyInput = /** @type {HTMLInputElement} */ ($('key-input'));
+  const authError = $('auth-error-msg');
+  const forgetKeyBtn = $('forget-key-btn');
+  const offlineBanner = $('offline-banner');
+  const playOverlay = $('play-overlay');
+  const audioToggleBtn = $('audio-toggle-btn');
+  const audioIcon = $('audio-icon');
+  const audioText = $('audio-text');
+  const qualityModeText = $('quality-mode-text');
+  const statusDot = $('status-dot');
+  const connStateEl = $('conn-state');
+  const iceStateEl = $('ice-state');
+  const feedStatsEl = $('feed-stats');
 
   // State
-  const STORAGE_KEY = 'petcam_viewer_key';
-  let viewerKey = localStorage.getItem(STORAGE_KEY) || '';
-
-  // Persistent Device ID so rescanning QR or refreshing replaces the same session (no ghost viewers)
-  const DEVICE_ID_KEY = 'petcam_device_id';
-  let deviceId = localStorage.getItem(DEVICE_ID_KEY);
-  if (!deviceId) {
-    deviceId = 'pixel_' + Math.random().toString(36).substring(2, 10);
-    localStorage.setItem(DEVICE_ID_KEY, deviceId);
-  }
-
-  /** @type {SignalingClient | null} */
+  let viewerKey = P.takeKeyFromFragment(KEY_STORAGE) || P.readStoredKey(KEY_STORAGE);
+  const deviceId = P.getDeviceId(DEVICE_STORAGE);
+  /** @type {RTCIceServer[]} */
+  let iceServers = [];
+  /** @type {InstanceType<typeof P.SignalingClient> | null} */
   let signaling = null;
   /** @type {RTCPeerConnection | null} */
   let pc = null;
+  let session = null;
   /** @type {RTCIceCandidateInit[]} */
-  let iceCandidatesQueue = [];
-  let isPublisherOnline = false;
-  let currentQuality = 'auto'; // 'auto' | 'high'
-  // Default to public STUN fallback so modern browser mDNS candidate masking (.local) resolves across devices
-  let iceServersConfig = [{ urls: 'stun:stun.l.google.com:19302' }];
+  let pending = [];
+  let publisherOnline = false;
+  let quality = 'auto';
 
-  // Watchdog state
-  let watchdogTimer = null;
+  let joinSentAt = 0;
+  let joinAttempts = 0;
+  let answeredAt = 0;
   let lastFramesDecoded = 0;
-  let stuckFramesSeconds = 0;
-  let consecutiveFailures = 0;
-  let isGracePeriodActive = false;
-  let graceTimeout = null;
-  let backoffCountdownTimer = null;
+  let stuckSeconds = 0;
+  let restartRequested = false;
+  let failures = 0;
+  let watchdogTimer = null;
+  let disconnectTimer = null;
+  let backoffTimer = null;
+  let loggedPair = false;
 
-  // 1. Initialization and Auth
-  function init() {
-    // Check if key is provided via URL fragment (e.g. from QR code scan: /watch#key=...)
-    if (window.location.hash) {
-      const hash = window.location.hash.substring(1);
-      const params = new URLSearchParams(hash);
-      const urlKey = params.get('key') || (hash.length >= 32 && !hash.includes('=') ? hash : null);
-      if (urlKey && urlKey.length >= 32) {
-        viewerKey = urlKey;
-        localStorage.setItem(STORAGE_KEY, viewerKey);
-        window.history.replaceState({}, document.title, window.location.pathname + window.location.search);
-        log('info', 'Viewer key imported seamlessly from QR code link');
-      }
-    }
+  // ------------------------------------------------------------------ init
 
-    if (viewerKey) {
-      keyCard?.classList.add('hidden');
-    } else {
-      keyCard?.classList.remove('hidden');
-    }
+  async function init() {
+    keyCard?.classList.toggle('hidden', !!viewerKey);
 
-    saveKeyBtn?.addEventListener('click', handleSaveKey);
+    $('save-key-btn')?.addEventListener('click', handleSaveKey);
+    keyInput?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') handleSaveKey();
+    });
     forgetKeyBtn?.addEventListener('click', handleForgetKey);
     audioToggleBtn?.addEventListener('click', toggleAudio);
-    qualityToggleBtn?.addEventListener('click', toggleQuality);
-    reconnectBtn?.addEventListener('click', () => manualReconnect('User requested reconnect'));
-
-    // Share QR Modal
-    const shareQrBtn = document.getElementById('share-qr-btn');
-    const qrModal = document.getElementById('qr-modal');
-    const closeQrBtn = document.getElementById('close-qr-btn');
-    const qrDisplay = document.getElementById('qr-code-display');
-    const qrLinkCopy = document.getElementById('qr-link-copy');
-
-    if (shareQrBtn && qrModal) {
-      shareQrBtn.addEventListener('click', () => {
-        if (!viewerKey) {
-          alert('Please enter or connect with your viewer key first.');
-          return;
-        }
-        const pairingUrl = `${window.location.origin}/watch#key=${encodeURIComponent(viewerKey)}`;
-        if (window.Petcam.renderQr && qrDisplay) {
-          window.Petcam.renderQr(qrDisplay, pairingUrl);
-        }
-        if (qrLinkCopy) {
-          qrLinkCopy.textContent = pairingUrl;
-          qrLinkCopy.onclick = () => {
-            navigator.clipboard.writeText(pairingUrl);
-            alert('Pairing link copied to clipboard!');
-          };
-        }
-        qrModal.classList.remove('hidden');
-      });
-
-      closeQrBtn?.addEventListener('click', () => {
-        qrModal.classList.add('hidden');
-      });
-    }
-
-    // Video fullscreen on single tap; ignore double-tap
+    $('quality-toggle-btn')?.addEventListener('click', toggleQuality);
+    $('reconnect-btn')?.addEventListener('click', () => {
+      failures = 0;
+      cancelBackoff();
+      if (signaling && signaling.isOpen) rebuild('reconnect button');
+      else if (signaling) signaling.reconnectNow();
+      else connectSignaling();
+    });
+    initShareQr();
     initFullscreenTap();
 
-    // Tap to play overlay listener
     playOverlay?.addEventListener('click', () => {
       remoteVideo.play().then(() => playOverlay.classList.add('hidden')).catch(() => {});
     });
-    remoteVideo?.addEventListener('playing', () => {
-      playOverlay?.classList.add('hidden');
-    });
+    remoteVideo?.addEventListener('playing', () => playOverlay?.classList.add('hidden'));
 
-    // Re-check on network online or tab visibility change
     window.addEventListener('online', () => {
-      log('info', 'Network came back ONLINE. Triggering immediate reconnect.');
-      manualReconnect('Network back online');
+      log('info', 'Network is back');
+      if (signaling && !signaling.isOpen) signaling.reconnectNow();
+      else if (pc && !isLive()) requestIceRestart('network changed');
     });
-
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') {
-        log('info', 'Tab became visible. Checking stream health.');
-        if (pc && pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') {
-          manualReconnect('Visibility changed to visible');
-        }
-      }
+      if (document.visibilityState !== 'visible') return;
+      if (signaling && !signaling.isOpen) signaling.reconnectNow();
+      else if (pc && !isLive()) requestIceRestart('page visible again');
+      else if (remoteVideo.paused && remoteVideo.srcObject) remoteVideo.play().catch(() => {});
     });
 
-    // Fetch STUN fallback config if enabled
-    fetch('/config.json')
-      .then((res) => res.json())
-      .then((data) => {
-        if (data && Array.isArray(data.ice_servers) && data.ice_servers.length > 0) {
-          iceServersConfig = data.ice_servers;
-        }
-      })
-      .catch(() => {});
-
-    if (viewerKey) {
-      connectSignaling();
-    }
+    iceServers = await P.loadIceServers();
+    if (viewerKey) connectSignaling();
   }
 
   function handleSaveKey() {
-    const val = keyInput?.value?.trim() || '';
-    if (val.length < 32) {
-      if (authErrorMsg) {
-        authErrorMsg.textContent = 'Viewer key must be at least 32 characters long.';
-        authErrorMsg.classList.remove('hidden');
-      }
+    const value = (keyInput?.value || '').trim();
+    if (value.length < 32) {
+      showAuthError('The key must be at least 32 characters. Copy it from config.toml on the server.');
       return;
     }
-    viewerKey = val;
-    localStorage.setItem(STORAGE_KEY, viewerKey);
+    viewerKey = value;
+    P.storeKey(KEY_STORAGE, value);
+    authError?.classList.add('hidden');
     keyCard?.classList.add('hidden');
-    connectSignaling();
+    if (signaling) signaling.reconnectNow();
+    else connectSignaling();
   }
 
-  let forgetConfirm = false;
+  let forgetArmed = false;
   function handleForgetKey() {
-    if (!forgetConfirm) {
-      forgetConfirm = true;
-      forgetKeyBtn.textContent = 'Confirm Forget?';
+    if (!forgetArmed) {
+      forgetArmed = true;
+      forgetKeyBtn.textContent = 'Tap again to forget';
       setTimeout(() => {
-        forgetConfirm = false;
-        forgetKeyBtn.textContent = 'Forget Key';
+        forgetArmed = false;
+        forgetKeyBtn.textContent = 'Forget key';
       }, 3000);
       return;
     }
-    localStorage.removeItem(STORAGE_KEY);
-    viewerKey = '';
-    forgetKeyBtn.textContent = 'Forget Key';
-    forgetConfirm = false;
+    P.storeKey(KEY_STORAGE, '');
     window.location.reload();
   }
 
-  // 2. Video Fullscreen & Audio Gestures
-  let lastTapTime = 0;
-  function initFullscreenTap() {
-    remoteVideo?.addEventListener('click', (e) => {
-      const now = Date.now();
-      // Ignore if double-tap (within 300ms)
-      if (now - lastTapTime < 300) {
-        lastTapTime = now;
-        return;
-      }
-      lastTapTime = now;
-
-      // Toggle fullscreen on container
-      if (!document.fullscreenElement) {
-        if (videoWrapper?.requestFullscreen) {
-          videoWrapper.requestFullscreen().catch(() => {});
-        } else if (remoteVideo.webkitEnterFullscreen) {
-          // iOS Safari fallback
-          remoteVideo.webkitEnterFullscreen();
-        }
-      } else {
-        if (document.exitFullscreen) {
-          document.exitFullscreen().catch(() => {});
-        }
-      }
-    });
+  function showAuthError(text) {
+    if (!authError) return;
+    authError.textContent = text;
+    authError.classList.remove('hidden');
   }
 
+  // -------------------------------------------------------------- controls
+
   function toggleAudio() {
-    if (remoteVideo.muted) {
-      remoteVideo.muted = false;
-      remoteVideo.play().catch(() => {});
-      if (audioIcon) audioIcon.textContent = '🔊';
-      if (audioText) audioText.textContent = 'Mute';
-      audioToggleBtn?.setAttribute('aria-label', 'Audio Playing. Click to Mute');
-      log('info', 'Audio unmuted by user gesture');
-    } else {
-      remoteVideo.muted = true;
-      if (audioIcon) audioIcon.textContent = '🔇';
-      if (audioText) audioText.textContent = 'Unmute';
-      audioToggleBtn?.setAttribute('aria-label', 'Audio Muted. Click to Unmute');
-      log('info', 'Audio muted');
-    }
+    remoteVideo.muted = !remoteVideo.muted;
+    if (!remoteVideo.muted) remoteVideo.play().catch(() => {});
+    if (audioIcon) audioIcon.textContent = remoteVideo.muted ? '🔇' : '🔊';
+    if (audioText) audioText.textContent = remoteVideo.muted ? 'Unmute' : 'Mute';
+    audioToggleBtn?.setAttribute('aria-label', remoteVideo.muted ? 'Unmute audio' : 'Mute audio');
   }
 
   function toggleQuality() {
-    currentQuality = currentQuality === 'auto' ? 'high' : 'auto';
-    if (qualityModeText) {
-      qualityModeText.textContent = currentQuality === 'high' ? 'High (2M)' : 'Auto (800k)';
-    }
-    if (signaling && isPublisherOnline) {
-      signaling.send({ type: 'quality', quality: currentQuality });
-      log('info', `Requested quality change to: ${currentQuality}`);
-    }
+    quality = quality === 'auto' ? 'high' : 'auto';
+    if (qualityModeText) qualityModeText.textContent = quality === 'high' ? 'High' : 'Auto';
+    if (signaling && signaling.isOpen && pc) signaling.send({ type: 'quality', quality });
   }
 
-  // 3. Signaling and WebRTC Connection
-  function connectSignaling() {
-    updateStateUI('Connecting...', 'connecting');
+  let lastTap = 0;
+  function initFullscreenTap() {
+    remoteVideo?.addEventListener('click', () => {
+      const now = Date.now();
+      const doubleTap = now - lastTap < 300;
+      lastTap = now;
+      if (doubleTap) return;
+      if (!document.fullscreenElement) {
+        if (videoWrapper?.requestFullscreen) videoWrapper.requestFullscreen().catch(() => {});
+        else if (remoteVideo.webkitEnterFullscreen) remoteVideo.webkitEnterFullscreen(); // iOS Safari
+      } else if (document.exitFullscreen) {
+        document.exitFullscreen().catch(() => {});
+      }
+    });
+  }
 
-    signaling = new SignalingClient({
+  function initShareQr() {
+    const modal = $('qr-modal');
+    const display = $('qr-code-display');
+    const link = $('qr-link-copy');
+    $('share-qr-btn')?.addEventListener('click', async () => {
+      if (!viewerKey) {
+        showAuthError('Enter the viewer key first.');
+        keyCard?.classList.remove('hidden');
+        return;
+      }
+      modal?.classList.remove('hidden');
+      if (display) display.innerHTML = '';
+      if (link) link.textContent = `${window.location.origin}/watch#key=${viewerKey}`;
+      try {
+        // The server draws the QR code; the key in the header proves we already have it.
+        const res = await fetch('/qr/watch.svg', { headers: { 'X-Petcam-Key': viewerKey }, cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (display) display.innerHTML = await res.text();
+      } catch (err) {
+        log('warn', `QR code unavailable: ${err.message}`);
+        if (display) display.innerHTML = '<p class="qr-error">Could not load the QR code. Use the link below instead.</p>';
+      }
+    });
+    $('close-qr-btn')?.addEventListener('click', () => modal?.classList.add('hidden'));
+  }
+
+  // ------------------------------------------------------------- signaling
+
+  function connectSignaling() {
+    setState('Connecting', 'connecting');
+    signaling = new P.SignalingClient({
       role: 'viewer',
       getKey: () => viewerKey,
       getDeviceId: () => deviceId,
-      onStateChange: (state) => {
-        if (state === 'error' || state === 'closed') {
-          updateStateUI('Disconnected', 'connecting');
-        }
+      onOpen: () => {
+        failures = 0;
+        cancelBackoff();
+        rebuild('signaling connected');
       },
-      onAuthOk: () => {
-        log('info', 'Viewer authenticated. Sending join request...');
-        signaling.send({ type: 'join' });
+      onClose: () => {
+        if (!backoffTimer) setState('Reconnecting', 'connecting');
       },
       onAuthFailed: (reason) => {
-        updateStateUI(`Auth Error: ${reason}`, 'error');
-        if (authErrorMsg) {
-          authErrorMsg.textContent = `Authentication failed: ${reason}`;
-          authErrorMsg.classList.remove('hidden');
-        }
+        setState('Wrong key', 'error');
+        showAuthError('The server rejected this key. Scan the phone QR code again or paste the viewer key.');
         keyCard?.classList.remove('hidden');
       },
-      onMessage: handleSignalingMessage,
+      onReplaced: () => {
+        closePeer();
+        setState('Opened elsewhere', 'error');
+        showAuthError('This phone opened the stream in another tab or window. Close this one, or tap Reconnect to watch here.');
+        keyCard?.classList.remove('hidden');
+      },
+      onViewerLimit: () => setState('Viewer limit reached', 'error'),
+      onMessage: enqueueMessage,
     });
-
     signaling.connect();
     startWatchdog();
   }
 
-  async function handleSignalingMessage(msg) {
-    const type = msg.type;
+  // Messages are handled one at a time, in order, so an 'offer' is fully
+  // answered before the next 'ice' or 'offer' is looked at.
+  let messageChain = Promise.resolve();
+  function enqueueMessage(msg) {
+    messageChain = messageChain
+      .then(() => handleMessage(msg))
+      .catch((err) => log('error', `Signaling handler failed for '${msg && msg.type}': ${err.message}`));
+  }
 
-    if (type === 'publisher_online') {
-      isPublisherOnline = true;
-      offlineBanner?.classList.add('hidden');
-      updateStateUI('Camera Online. Connecting...', 'connecting');
-      log('info', 'Publisher is online.');
-    } else if (type === 'publisher_offline') {
-      isPublisherOnline = false;
-      offlineBanner?.classList.remove('hidden');
-      updateStateUI('Camera offline', 'connecting');
-      cleanupPeerConnection();
-      log('info', 'Publisher is offline.');
-    } else if (type === 'publisher_changed') {
-      log('info', 'Publisher changed on server. Resetting connection...');
-      cleanupPeerConnection();
-      if (signaling) {
-        signaling.send({ type: 'join' });
-      }
-    } else if (type === 'offer') {
-      log('info', 'Received SDP offer from publisher');
-      await handleOffer(msg.sdp);
-    } else if (type === 'ice') {
-      if (msg.candidate) {
-        handleRemoteIceCandidate(msg.candidate);
-      }
-    } else if (type === 'error' && msg.reason === 'too_many_viewers') {
-      updateStateUI('Viewer limit reached', 'error');
-      alert('Too many viewers connected (server maximum reached). Please try again later.');
+  async function handleMessage(msg) {
+    switch (msg.type) {
+      case 'publisher_online':
+        publisherOnline = true;
+        offlineBanner?.classList.add('hidden');
+        if (!isLive()) setState('Camera online, connecting', 'connecting');
+        break;
+      case 'publisher_offline':
+        publisherOnline = false;
+        closePeer();
+        offlineBanner?.classList.remove('hidden');
+        setState('Camera offline', 'connecting');
+        break;
+      case 'publisher_changed':
+        log('info', 'Publisher reconnected; joining again');
+        rebuild('publisher changed');
+        break;
+      case 'offer':
+        await handleOffer(msg);
+        break;
+      case 'ice':
+        await handleRemoteCandidate(msg);
+        break;
+      case 'error':
+        if (msg.reason === 'too_many_viewers') setState('Viewer limit reached', 'error');
+        break;
+      default:
+        log('warn', `Unknown signaling message '${msg.type}'`);
     }
   }
 
-  async function handleOffer(sdp) {
+  function sendJoin() {
+    if (!signaling || !signaling.isOpen) return;
+    joinAttempts += 1;
+    joinSentAt = Date.now();
+    signaling.send({ type: 'join' });
+  }
+
+  /** Drop the current connection and ask the publisher for a brand-new offer. */
+  function rebuild(reason) {
+    log('info', `Requesting a fresh offer (${reason})`);
+    closePeer();
+    joinAttempts = 0;
+    if (signaling && signaling.isOpen) {
+      setState('Connecting', 'connecting');
+      sendJoin();
+    } else if (signaling) {
+      signaling.reconnectNow();
+    }
+  }
+
+  function requestIceRestart(reason) {
+    if (!signaling || !signaling.isOpen || !pc) return;
+    if (restartRequested) return;
+    restartRequested = true;
+    log('info', `Requesting ICE restart: ${reason}`);
+    signaling.send({ type: 'restart' });
+  }
+
+  // ---------------------------------------------------------------- WebRTC
+
+  async function handleOffer(msg) {
+    const offerSession = typeof msg.session === 'string' ? msg.session : null;
     try {
-      if (pc) {
-        cleanupPeerConnection();
+      if (msg.restart) {
+        if (!pc || !offerSession || offerSession !== session || pc.signalingState !== 'stable') {
+          log('warn', 'ICE-restart offer does not match the current connection; joining again');
+          rebuild('stale restart offer');
+          return;
+        }
+        log('info', `ICE-restart offer for session ${session}`);
+      } else {
+        closePeer();
+        session = offerSession;
+        pc = createPeerConnection();
+        log('info', `New offer (session ${session})`);
       }
-
-      iceCandidatesQueue = [];
-
-      const rtcConfig = {
-        iceServers: iceServersConfig,
-        bundlePolicy: 'max-bundle',
-        rtcpMuxPolicy: 'require',
-      };
-
-      pc = new RTCPeerConnection(rtcConfig);
-
-      // On incoming media track, attach to video element safely
-      pc.ontrack = (event) => {
-        log('info', `Received remote track kind=${event.track.kind}`);
-        const stream = event.streams && event.streams[0] ? event.streams[0] : null;
-        if (stream && remoteVideo.srcObject !== stream) {
-          remoteVideo.srcObject = stream;
-        }
-
-        if (remoteVideo.paused) {
-          const playPromise = remoteVideo.play();
-          if (playPromise !== undefined) {
-            playPromise
-              .then(() => {
-                playOverlay?.classList.add('hidden');
-              })
-              .catch((err) => {
-                // If Chrome aborts because another track loaded concurrently, ignore
-                if (err.name !== 'AbortError') {
-                  log('warn', `Autoplay: ${err.message}. Tap screen to play.`);
-                  playOverlay?.classList.remove('hidden');
-                }
-              });
-          }
-        }
-      };
-
-      // Trickle ICE to server
-      pc.onicecandidate = (event) => {
-        if (event.candidate && signaling) {
-          log('info', `Sent local ICE candidate: ${event.candidate.type || 'host'} (${event.candidate.protocol})`);
-          signaling.send({
-            type: 'ice',
-            candidate: event.candidate,
-          });
-        }
-      };
-
-      pc.onconnectionstatechange = () => {
-        const connState = pc ? pc.connectionState : 'closed';
-        log('info', `WebRTC connection state changed to: ${connState}`);
-        if (connState === 'connected') {
-          updateStateUI('Live', 'online');
-          consecutiveFailures = 0;
-          stuckFramesSeconds = 0;
-        } else if (connState === 'failed') {
-          log('warn', 'WebRTC connection failed! Triggering watchdog restart.');
-          triggerWatchdogRestart();
-        }
-      };
-
-      pc.oniceconnectionstatechange = () => {
-        const iceState = pc ? pc.iceConnectionState : 'closed';
-        if (iceStateEl) iceStateEl.textContent = iceState;
-        log('info', `ICE connection state changed to: ${iceState}`);
-
-        if (iceState === 'connected' || iceState === 'completed') {
-          updateStateUI('Live', 'online');
-          consecutiveFailures = 0;
-          stuckFramesSeconds = 0;
-        } else if (iceState === 'disconnected') {
-          // Grace period of 5 seconds before attempting restart
-          handleGracePeriod();
-        } else if (iceState === 'failed') {
-          log('warn', 'ICE failed! Triggering watchdog restart.');
-          triggerWatchdogRestart();
-        }
-      };
-
-      // Set remote SDP offer
-      await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp }));
-
-      // Flush any queued ICE candidates that arrived before remoteDescription was set
-      while (iceCandidatesQueue.length > 0) {
-        const candidate = iceCandidatesQueue.shift();
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-          log('info', `Flushed buffered candidate: ${candidate.type || 'cand'}`);
-        } catch (e) {
-          log('warn', `Failed adding queued candidate: ${e.message}`);
-        }
-      }
-
-      // Create and send SDP answer
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
-      if (signaling) {
-        signaling.send({
-          type: 'answer',
-          sdp: answer.sdp,
-        });
-        log('info', 'Sent SDP answer back to publisher');
-      }
-
-      // If user had toggled High quality before connecting, request it now
-      if (currentQuality === 'high' && signaling) {
-        signaling.send({ type: 'quality', quality: 'high' });
-      }
+      const current = pc;
+      await current.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+      if (pc !== current) return;
+      await flushPending(current);
+      const answer = await current.createAnswer();
+      await current.setLocalDescription(answer);
+      if (pc !== current) return;
+      signaling.send({ type: 'answer', session, sdp: current.localDescription.sdp });
+      answeredAt = Date.now();
+      restartRequested = false;
+      joinSentAt = 0;
+      if (quality === 'high') signaling.send({ type: 'quality', quality: 'high' });
     } catch (err) {
-      log('error', `Failed to handle offer: ${err.message}`);
-      updateStateUI(`Error: ${err.message}`, 'error');
+      log('error', `Could not answer the offer: ${err.message}`);
+      setState(`Error: ${err.message}`, 'error');
+      fail('answer failed');
     }
   }
 
-  async function handleRemoteIceCandidate(candidate) {
-    if (!pc || !pc.remoteDescription) {
-      // Buffer until setRemoteDescription finishes
-      iceCandidatesQueue.push(candidate);
+  function createPeerConnection() {
+    const conn = new RTCPeerConnection(P.rtcConfig(iceServers));
+    pending = [];
+    stuckSeconds = 0;
+    lastFramesDecoded = 0;
+    loggedPair = false;
+    clearDisconnectTimer();
+
+    conn.ontrack = (event) => {
+      if (pc !== conn) return;
+      log('info', `Remote ${event.track.kind} track received`);
+      let stream = event.streams && event.streams[0];
+      if (!stream) {
+        stream = remoteVideo.srcObject instanceof MediaStream ? remoteVideo.srcObject : new MediaStream();
+        stream.addTrack(event.track);
+      }
+      if (remoteVideo.srcObject !== stream) remoteVideo.srcObject = stream;
+      const playing = remoteVideo.play();
+      if (playing) {
+        playing
+          .then(() => playOverlay?.classList.add('hidden'))
+          .catch((err) => {
+            if (err.name !== 'AbortError') {
+              log('warn', `Autoplay blocked: ${err.message}`);
+              playOverlay?.classList.remove('hidden');
+            }
+          });
+      }
+    };
+
+    conn.onicecandidate = (event) => {
+      if (pc !== conn || !event.candidate || !signaling) return;
+      log('info', `Local candidate: ${P.describeCandidate(event.candidate)}`);
+      signaling.send({ type: 'ice', session, candidate: event.candidate.toJSON() });
+    };
+
+    conn.oniceconnectionstatechange = () => {
+      if (pc !== conn) return;
+      const state = conn.iceConnectionState;
+      if (iceStateEl) iceStateEl.textContent = state;
+      log('info', `ICE ${state}`);
+      if (state === 'connected' || state === 'completed') {
+        clearDisconnectTimer();
+        failures = 0;
+        restartRequested = false;
+        setState('Live', 'online');
+        if (!loggedPair) {
+          loggedPair = true;
+          P.describeSelectedPair(conn).then((pair) => pair && log('info', `Media path: ${pair}`));
+        }
+      } else if (state === 'disconnected') {
+        setState('Reconnecting', 'connecting');
+        if (!disconnectTimer) {
+          disconnectTimer = setTimeout(() => {
+            disconnectTimer = null;
+            if (pc === conn && conn.iceConnectionState === 'disconnected') requestIceRestart('still disconnected after grace period');
+          }, ICE_DISCONNECT_GRACE_MS);
+        }
+      } else if (state === 'failed') {
+        fail('ICE failed');
+      }
+    };
+
+    conn.onconnectionstatechange = () => {
+      if (pc !== conn) return;
+      log('info', `Connection ${conn.connectionState}`);
+      if (conn.connectionState === 'failed') fail('connection failed');
+    };
+
+    return conn;
+  }
+
+  async function handleRemoteCandidate(msg) {
+    if (!pc || !msg.candidate) return;
+    if (typeof msg.session === 'string' && msg.session !== session) return; // from an older offer
+    if (!pc.remoteDescription) {
+      pending.push(msg.candidate);
       return;
     }
     try {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      log('info', `Added remote ICE candidate: ${candidate.type || 'cand'}`);
-    } catch (e) {
-      log('warn', `Failed to add remote candidate: ${e.message}`);
+      await pc.addIceCandidate(msg.candidate);
+    } catch (err) {
+      log('warn', `addIceCandidate failed: ${err.message}`);
     }
   }
 
-  function handleGracePeriod() {
-    if (isGracePeriodActive) return;
-    isGracePeriodActive = true;
-    log('info', 'ICE disconnected. Starting 5s grace period before recovery.');
-
-    if (graceTimeout) clearTimeout(graceTimeout);
-    graceTimeout = setTimeout(() => {
-      isGracePeriodActive = false;
-      if (pc && pc.iceConnectionState === 'disconnected') {
-        log('warn', 'Grace period ended and still disconnected. Triggering restart.');
-        triggerWatchdogRestart();
+  async function flushPending(conn) {
+    const queued = pending.splice(0);
+    for (const candidate of queued) {
+      try {
+        await conn.addIceCandidate(candidate);
+      } catch (err) {
+        log('warn', `Queued candidate rejected: ${err.message}`);
       }
-    }, 5000);
+    }
+    if (queued.length) log('info', `Applied ${queued.length} queued candidate(s)`);
   }
 
-  // 4. Watchdog & Self-Healing Logic
+  function isLive() {
+    if (!pc) return false;
+    const s = pc.iceConnectionState;
+    return s === 'connected' || s === 'completed';
+  }
+
+  function closePeer() {
+    clearDisconnectTimer();
+    restartRequested = false;
+    answeredAt = 0;
+    pending = [];
+    if (pc) {
+      pc.ontrack = pc.onicecandidate = pc.oniceconnectionstatechange = pc.onconnectionstatechange = null;
+      try {
+        pc.close();
+      } catch (_) {
+        /* ignore */
+      }
+      pc = null;
+    }
+    session = null;
+    remoteVideo.srcObject = null;
+    if (iceStateEl) iceStateEl.textContent = 'closed';
+    if (feedStatsEl) feedStatsEl.textContent = '–';
+  }
+
+  function clearDisconnectTimer() {
+    if (disconnectTimer) clearTimeout(disconnectTimer);
+    disconnectTimer = null;
+  }
+
+  // -------------------------------------------------------------- watchdog
+
   function startWatchdog() {
     if (watchdogTimer) clearInterval(watchdogTimer);
-
-    // Watchdog polls getStats every 2 seconds
-    watchdogTimer = setInterval(async () => {
-      if (!pc || !isPublisherOnline) return;
-
-      const stats = await readVideoStats(pc, 'inbound');
-
-      // Update resolution and fps
-      if (feedStatsEl && (stats.width > 0 || stats.fps > 0)) {
-        feedStatsEl.textContent = `${stats.width}x${stats.height} @ ${stats.fps}fps`;
-      }
-
-      const isLive = pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
-      if (!isLive) return;
-
-      // Check if framesDecoded is progressing
-      if (stats.frames === lastFramesDecoded) {
-        stuckFramesSeconds += 2;
-      } else {
-        stuckFramesSeconds = 0;
-        lastFramesDecoded = stats.frames;
-        consecutiveFailures = 0;
-      }
-
-      // Watchdog rule: stuck for 8s -> send restart (ICE restart)
-      if (stuckFramesSeconds === 8) {
-        log('warn', 'Watchdog: Video frames stuck for 8s. Requesting ICE restart from publisher.');
-        if (signaling) {
-          signaling.send({ type: 'restart' });
-        }
-      }
-
-      // Watchdog rule: still stuck 10s later (total 18s) -> close connection and send join
-      if (stuckFramesSeconds >= 18) {
-        log('warn', 'Watchdog: Video frames still stuck after ICE restart. Rebuilding connection.');
-        triggerWatchdogRestart();
-      }
-    }, 2000);
+    watchdogTimer = setInterval(checkHealth, WATCHDOG_INTERVAL_MS);
   }
 
-  function triggerWatchdogRestart() {
-    consecutiveFailures++;
-    stuckFramesSeconds = 0;
+  async function checkHealth() {
+    if (!signaling || !signaling.isOpen || backoffTimer || !publisherOnline) return;
+    const now = Date.now();
 
-    if (consecutiveFailures >= 3) {
-      log('warn', 'Watchdog: 3 consecutive failures. Backing off for 30s before retrying.');
-      startBackoffCountdown(30);
+    if (!pc) {
+      // Joined but no offer yet: ask again, waiting a bit longer each time.
+      if (joinSentAt && now - joinSentAt > Math.min(OFFER_TIMEOUT_MS * joinAttempts, 30000)) {
+        log('warn', `No offer after ${Math.round((now - joinSentAt) / 1000)}s; joining again`);
+        sendJoin();
+      }
       return;
     }
 
-    manualReconnect('Watchdog automatic recovery');
+    const stats = await P.readVideoStats(pc, 'inbound');
+    if (feedStatsEl && (stats.width || stats.fps)) feedStatsEl.textContent = `${stats.width}x${stats.height} @ ${stats.fps}fps`;
+
+    if (!isLive()) {
+      if (answeredAt && now - answeredAt > CONNECT_TIMEOUT_MS) fail('ICE never connected');
+      return;
+    }
+
+    if (stats.frames === lastFramesDecoded) stuckSeconds += WATCHDOG_INTERVAL_MS / 1000;
+    else stuckSeconds = 0;
+    lastFramesDecoded = stats.frames;
+
+    if (stuckSeconds >= STUCK_REBUILD_SECONDS) {
+      fail(`no video for ${stuckSeconds}s`);
+    } else if (stuckSeconds >= STUCK_RESTART_SECONDS) {
+      setState('Video stalled, recovering', 'connecting');
+      requestIceRestart(`no video for ${stuckSeconds}s`);
+    }
   }
 
-  function startBackoffCountdown(seconds) {
-    cleanupPeerConnection();
-    let remaining = seconds;
+  function fail(reason) {
+    failures += 1;
+    stuckSeconds = 0;
+    log('warn', `Connection failure #${failures}: ${reason}`);
+    if (failures >= MAX_FAILURES_BEFORE_BACKOFF) {
+      startBackoff();
+      return;
+    }
+    rebuild(reason);
+  }
 
-    if (backoffCountdownTimer) clearInterval(backoffCountdownTimer);
-
-    updateStateUI(`Reconnecting (${remaining}s)...`, 'connecting');
-    backoffCountdownTimer = setInterval(() => {
-      remaining--;
-      if (remaining <= 0) {
-        clearInterval(backoffCountdownTimer);
-        backoffCountdownTimer = null;
-        consecutiveFailures = 0;
-        manualReconnect('Backoff period expired');
-      } else {
-        updateStateUI(`Reconnecting (${remaining}s)...`, 'connecting');
+  function startBackoff() {
+    closePeer();
+    cancelBackoff();
+    let remaining = BACKOFF_SECONDS;
+    setState(`Retrying in ${remaining}s`, 'connecting');
+    backoffTimer = setInterval(() => {
+      remaining -= 1;
+      if (remaining > 0) {
+        setState(`Retrying in ${remaining}s`, 'connecting');
+        return;
       }
+      cancelBackoff();
+      failures = 0;
+      rebuild('retry after backoff');
     }, 1000);
   }
 
-  function manualReconnect(reason) {
-    log('info', `Reconnecting stream. Reason: ${reason}`);
-    if (backoffCountdownTimer) {
-      clearInterval(backoffCountdownTimer);
-      backoffCountdownTimer = null;
-    }
-    cleanupPeerConnection();
-    updateStateUI('Reconnecting...', 'connecting');
-
-    if (signaling && signaling.isAuthenticated) {
-      signaling.send({ type: 'join' });
-    } else if (signaling) {
-      signaling.connect();
-    }
+  function cancelBackoff() {
+    if (backoffTimer) clearInterval(backoffTimer);
+    backoffTimer = null;
   }
 
-  function cleanupPeerConnection() {
-    if (pc) {
-      try {
-        pc.close();
-      } catch (e) {}
-      pc = null;
+  function setState(text, kind) {
+    if (connStateEl) {
+      connStateEl.textContent = text;
+      connStateEl.className = 'val ' + (kind === 'online' ? 'val-online' : kind === 'error' ? 'val-error' : 'val-connecting');
     }
-    if (remoteVideo) {
-      remoteVideo.srcObject = null;
-    }
-    if (iceStateEl) iceStateEl.textContent = 'closed';
-    if (feedStatsEl) feedStatsEl.textContent = '0x0 @ 0fps';
-  }
-
-  function updateStateUI(text, statusType) {
-    if (connStateEl) connStateEl.textContent = text;
-
     statusDot?.classList.remove('online', 'connecting', 'error');
-    if (statusType === 'online') {
-      statusDot?.classList.add('online');
-    } else if (statusType === 'connecting') {
-      statusDot?.classList.add('connecting');
-    } else if (statusType === 'error') {
-      statusDot?.classList.add('error');
-    }
+    statusDot?.classList.add(kind);
   }
 
   document.addEventListener('DOMContentLoaded', init);
