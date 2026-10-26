@@ -20,7 +20,7 @@ class Settings:
     publisher_key: str
     viewer_key: str
     max_viewers: int = 4
-    stun_enabled: bool = False
+    stun_enabled: bool = True
     port: int = 8000
 
 
@@ -47,7 +47,7 @@ def load_settings(config_path: str | Path = "config.toml") -> Settings:
     if stun_enabled_raw is not None:
         stun_enabled = stun_enabled_raw.lower() in ("true", "1", "yes")
     else:
-        stun_enabled = bool(file_data.get("stun_enabled", False))
+        stun_enabled = bool(file_data.get("stun_enabled", True))
 
     port_raw = os.getenv("PETCAM_PORT", str(file_data.get("port", 8000)))
     try:

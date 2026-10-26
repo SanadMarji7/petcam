@@ -23,6 +23,7 @@
   const forgetKeyBtn = document.getElementById('forget-key-btn');
   const authErrorMsg = document.getElementById('auth-error-msg');
   const offlineBanner = document.getElementById('offline-banner');
+  const playOverlay = document.getElementById('play-overlay');
 
   // Controls & Status Strip
   const audioToggleBtn = document.getElementById('audio-toggle-btn');
@@ -48,7 +49,8 @@
   let iceCandidatesQueue = [];
   let isPublisherOnline = false;
   let currentQuality = 'auto'; // 'auto' | 'high'
-  let iceServersConfig = [];
+  // Default to public STUN fallback so modern browser mDNS candidate masking (.local) resolves across devices
+  let iceServersConfig = [{ urls: 'stun:stun.l.google.com:19302' }];
 
   // Watchdog state
   let watchdogTimer = null;
@@ -120,6 +122,14 @@
 
     // Video fullscreen on single tap; ignore double-tap
     initFullscreenTap();
+
+    // Tap to play overlay listener
+    playOverlay?.addEventListener('click', () => {
+      remoteVideo.play().then(() => playOverlay.classList.add('hidden')).catch(() => {});
+    });
+    remoteVideo?.addEventListener('playing', () => {
+      playOverlay?.classList.add('hidden');
+    });
 
     // Re-check on network online or tab visibility change
     window.addEventListener('online', () => {
@@ -320,14 +330,29 @@
 
       pc = new RTCPeerConnection(rtcConfig);
 
-      // On incoming media track, attach to video element
+      // On incoming media track, attach to video element safely
       pc.ontrack = (event) => {
         log('info', `Received remote track kind=${event.track.kind}`);
-        if (remoteVideo.srcObject !== event.streams[0]) {
-          remoteVideo.srcObject = event.streams[0];
-          remoteVideo.play().catch((err) => {
-            log('warn', `Autoplay prevented: ${err.message}. Tap to play.`);
-          });
+        const stream = event.streams && event.streams[0] ? event.streams[0] : null;
+        if (stream && remoteVideo.srcObject !== stream) {
+          remoteVideo.srcObject = stream;
+        }
+
+        if (remoteVideo.paused) {
+          const playPromise = remoteVideo.play();
+          if (playPromise !== undefined) {
+            playPromise
+              .then(() => {
+                playOverlay?.classList.add('hidden');
+              })
+              .catch((err) => {
+                // If Chrome aborts because another track loaded concurrently, ignore
+                if (err.name !== 'AbortError') {
+                  log('warn', `Autoplay: ${err.message}. Tap screen to play.`);
+                  playOverlay?.classList.remove('hidden');
+                }
+              });
+          }
         }
       };
 

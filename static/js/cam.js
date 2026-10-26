@@ -52,7 +52,8 @@
   let lastFramesEncoded = 0;
   let framesStuckSeconds = 0;
   let isRecovering = false;
-  let iceServersConfig = [];
+  // Default to public STUN fallback so iOS/Android mDNS anonymized candidates (.local) resolve
+  let iceServersConfig = [{ urls: 'stun:stun.l.google.com:19302' }];
 
   // 1. Initialization and Key Management
   function init() {
@@ -326,6 +327,16 @@
         log('info', `Setting remote description (answer) for viewer [${viewerId}]`);
         try {
           await conn.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: msg.sdp }));
+          // Flush any buffered candidates that arrived before the SDP answer
+          if (conn.iceQueue && conn.iceQueue.length > 0) {
+            log('info', `Flushing ${conn.iceQueue.length} queued ICE candidate(s) for [${viewerId}]`);
+            while (conn.iceQueue.length > 0) {
+              const cand = conn.iceQueue.shift();
+              try {
+                await conn.pc.addIceCandidate(new RTCIceCandidate(cand));
+              } catch (err) {}
+            }
+          }
         } catch (e) {
           log('error', `Failed to set remote answer for [${viewerId}]: ${e.message}`);
         }
@@ -335,10 +346,15 @@
       const viewerId = msg.viewer_id;
       const conn = peerConnections.get(viewerId);
       if (conn && conn.pc && msg.candidate) {
-        try {
-          await conn.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-        } catch (e) {
-          log('warn', `Failed to add ICE candidate for [${viewerId}]: ${e.message}`);
+        if (!conn.pc.remoteDescription) {
+          if (!conn.iceQueue) conn.iceQueue = [];
+          conn.iceQueue.push(msg.candidate);
+        } else {
+          try {
+            await conn.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+          } catch (e) {
+            log('warn', `Failed to add ICE candidate for [${viewerId}]: ${e.message}`);
+          }
         }
       }
     } else if (type === 'viewer_restart') {
@@ -386,7 +402,7 @@
       };
 
       pc = new RTCPeerConnection(rtcConfig);
-      conn = { pc, makingOffer: false, quality: 'auto' };
+      conn = { pc, makingOffer: false, quality: 'auto', iceQueue: [] };
       peerConnections.set(viewerId, conn);
 
       // Add local tracks (sendonly)

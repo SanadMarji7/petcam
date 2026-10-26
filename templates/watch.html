@@ -44,6 +44,13 @@
             <p class="center-banner-desc">Waiting for the iPad publisher to connect. Reconnection will happen automatically.</p>
           </div>
 
+          <!-- Tap to Play Banner if browser autoplay policy blocks playback -->
+          <div id="play-overlay" class="center-banner hidden" style="cursor: pointer; z-index: 15;">
+            <div class="center-banner-icon">▶️</div>
+            <h2 class="center-banner-title">Tap to Start Video</h2>
+            <p class="center-banner-desc">Browser autoplay paused. Tap screen to resume live video.</p>
+          </div>
+
           <!-- Auth Key Prompt Card (if not in localStorage) -->
           <div id="key-card" class="overlay-card hidden">
             <h2 class="card-heading">Viewer Authentication</h2>

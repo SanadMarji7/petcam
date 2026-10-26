@@ -14,8 +14,8 @@ viewer_key = "CHANGE_ME_TO_32_CHAR_RANDOM_VIEWER_KEY"
 # Maximum concurrent viewers allowed (default: 4)
 max_viewers = 4
 
-# Fallback STUN server (off by default; Tailscale direct IPs connect directly)
-stun_enabled = false
+# Fallback STUN server (resolves modern iOS/Android .local mDNS host candidate masking)
+stun_enabled = true
 
 # Internal port for Uvicorn (tailscale serve will proxy https to 127.0.0.1:port)
 port = 8000

@@ -324,7 +324,7 @@ hostname = "{hostname}"
 publisher_key = "{publisher_key}"
 viewer_key = "{viewer_key}"
 max_viewers = 4
-stun_enabled = false
+stun_enabled = true
 port = 8000
 """
                 with open(config_path, "w", encoding="utf-8") as f:
@@ -349,7 +349,7 @@ viewer_key = "{viewer_key}"
 
 # Settings
 max_viewers = 4
-stun_enabled = false
+stun_enabled = true
 port = 8000
 """
         with open(config_path, "w", encoding="utf-8") as f:
