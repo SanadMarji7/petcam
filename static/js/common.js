@@ -98,6 +98,7 @@ class SignalingClient {
   constructor(options) {
     this.role = options.role;
     this.getKey = options.getKey;
+    this.getDeviceId = options.getDeviceId;
     this.onMessage = options.onMessage;
     this.onStateChange = options.onStateChange || (() => {});
     this.onAuthOk = options.onAuthOk || (() => {});
@@ -145,11 +146,15 @@ class SignalingClient {
       this.onStateChange('connecting');
       this.reconnectAttempts = 0;
 
-      // First message must be {"type": "auth", "key": "..."} within 5s
-      this.send({
+      // First message must be {"type": "auth", "key": "...", "device_id": "..."} within 5s
+      const authPayload = {
         type: 'auth',
         key: this.getKey(),
-      });
+      };
+      if (this.getDeviceId) {
+        authPayload.device_id = this.getDeviceId();
+      }
+      this.send(authPayload);
     };
 
     this.ws.onmessage = (event) => {

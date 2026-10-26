@@ -41,6 +41,15 @@
   // State
   const STORAGE_KEY = 'petcam_viewer_key';
   let viewerKey = localStorage.getItem(STORAGE_KEY) || '';
+
+  // Persistent Device ID so rescanning QR or refreshing replaces the same session (no ghost viewers)
+  const DEVICE_ID_KEY = 'petcam_device_id';
+  let deviceId = localStorage.getItem(DEVICE_ID_KEY);
+  if (!deviceId) {
+    deviceId = 'pixel_' + Math.random().toString(36).substring(2, 10);
+    localStorage.setItem(DEVICE_ID_KEY, deviceId);
+  }
+
   /** @type {SignalingClient | null} */
   let signaling = null;
   /** @type {RTCPeerConnection | null} */
@@ -150,7 +159,7 @@
     fetch('/config.json')
       .then((res) => res.json())
       .then((data) => {
-        if (data && data.ice_servers) {
+        if (data && Array.isArray(data.ice_servers) && data.ice_servers.length > 0) {
           iceServersConfig = data.ice_servers;
         }
       })
@@ -257,6 +266,7 @@
     signaling = new SignalingClient({
       role: 'viewer',
       getKey: () => viewerKey,
+      getDeviceId: () => deviceId,
       onStateChange: (state) => {
         if (state === 'error' || state === 'closed') {
           updateStateUI('Disconnected', 'connecting');
@@ -359,10 +369,24 @@
       // Trickle ICE to server
       pc.onicecandidate = (event) => {
         if (event.candidate && signaling) {
+          log('info', `Sent local ICE candidate: ${event.candidate.type || 'host'} (${event.candidate.protocol})`);
           signaling.send({
             type: 'ice',
             candidate: event.candidate,
           });
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        const connState = pc ? pc.connectionState : 'closed';
+        log('info', `WebRTC connection state changed to: ${connState}`);
+        if (connState === 'connected') {
+          updateStateUI('Live', 'online');
+          consecutiveFailures = 0;
+          stuckFramesSeconds = 0;
+        } else if (connState === 'failed') {
+          log('warn', 'WebRTC connection failed! Triggering watchdog restart.');
+          triggerWatchdogRestart();
         }
       };
 
@@ -392,6 +416,7 @@
         const candidate = iceCandidatesQueue.shift();
         try {
           await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          log('info', `Flushed buffered candidate: ${candidate.type || 'cand'}`);
         } catch (e) {
           log('warn', `Failed adding queued candidate: ${e.message}`);
         }
@@ -427,6 +452,7 @@
     }
     try {
       await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      log('info', `Added remote ICE candidate: ${candidate.type || 'cand'}`);
     } catch (e) {
       log('warn', `Failed to add remote candidate: ${e.message}`);
     }

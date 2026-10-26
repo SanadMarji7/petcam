@@ -92,13 +92,13 @@
     fetch('/config.json')
       .then((res) => res.json())
       .then((data) => {
-        if (data && data.ice_servers) {
+        if (data && Array.isArray(data.ice_servers) && data.ice_servers.length > 0) {
           iceServersConfig = data.ice_servers;
           log('info', `Loaded ICE server configuration (${iceServersConfig.length} servers)`);
         }
       })
       .catch(() => {
-        log('info', 'Defaulting to direct Tailscale ICE (no STUN)');
+        log('info', 'Using built-in STUN fallback');
       });
 
     // Handle iOS Safari visibility change (wake lock release & watchdog recovery)
@@ -431,12 +431,17 @@
       // Trickle ICE candidates
       pc.onicecandidate = (event) => {
         if (event.candidate && signaling) {
+          log('info', `[${viewerId}] Sent local ICE candidate: ${event.candidate.type || 'cand'}`);
           signaling.send({
             type: 'ice',
             viewer_id: viewerId,
             candidate: event.candidate,
           });
         }
+      };
+
+      pc.onconnectionstatechange = () => {
+        log('info', `Viewer [${viewerId}] WebRTC connection state: ${pc.connectionState}`);
       };
 
       pc.oniceconnectionstatechange = () => {

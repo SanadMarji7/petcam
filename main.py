@@ -99,7 +99,22 @@ class Hub:
 
     async def add_viewer(self, client: Client) -> bool:
         async with self.lock:
-            if len(self.viewers) >= self.settings.max_viewers:
+            # Check if this exact device is already registered (e.g. page refreshed or QR re-scanned)
+            existing = self.viewers.pop(client.id, None)
+            if existing is not None:
+                logger.info("[%s:%s] Existing session for device found. Replacing with new session.", client.role, client.id)
+                try:
+                    await existing.websocket.close(code=1000, reason="Replaced by new session from same device")
+                except Exception:
+                    pass
+                if self.publisher is not None:
+                    try:
+                        await self.publisher.websocket.send_text(
+                            json.dumps({"type": "viewer_left", "viewer_id": client.id})
+                        )
+                    except Exception:
+                        pass
+            elif len(self.viewers) >= self.settings.max_viewers:
                 logger.warning(
                     "[%s:%s] Rejected connection: viewer limit reached (%d/%d)",
                     client.role,
@@ -108,6 +123,7 @@ class Hub:
                     self.settings.max_viewers,
                 )
                 return False
+
             self.viewers[client.id] = client
             logger.info("[%s:%s] Viewer registered (active viewers: %d)", client.role, client.id, len(self.viewers))
             return True
@@ -144,12 +160,7 @@ class Hub:
         async with self.lock:
             viewer = self.viewers.get(viewer_id)
             if viewer is None:
-                logger.warning(
-                    "[%s:%s] Cannot forward message to unknown viewer [%s]",
-                    source_client.role,
-                    source_client.id,
-                    viewer_id,
-                )
+                logger.debug("[%s:%s] Viewer [%s] no longer active, dropped message", source_client.role, source_client.id, viewer_id)
                 return
             try:
                 await viewer.websocket.send_text(json.dumps(msg))
@@ -330,11 +341,13 @@ async def get_healthz() -> dict[str, object]:
 
 @app.get("/config.json")
 async def get_client_config() -> dict[str, object]:
-    ice_servers: list[dict[str, str]] = []
-    if settings.stun_enabled:
-        ice_servers.append({"urls": "stun:stun.l.google.com:19302"})
+    # Always supply reliable public STUN servers so modern browser .local mDNS host candidate obfuscation resolves
+    ice_servers: list[dict[str, str]] = [
+        {"urls": "stun:stun.l.google.com:19302"},
+        {"urls": "stun:stun1.l.google.com:19302"},
+    ]
     return {
-        "stun_enabled": settings.stun_enabled,
+        "stun_enabled": True,
         "ice_servers": ice_servers,
     }
 
@@ -371,7 +384,13 @@ async def perform_auth_handshake(
         await websocket.close(code=4401, reason="Authentication failed")
         return None
 
-    client_id = secrets.token_hex(4)
+    # Use persistent device_id if provided (e.g. from phone localStorage), else generate random id
+    raw_device_id = str(data.get("device_id") or "").strip()
+    if raw_device_id and len(raw_device_id) <= 64:
+        client_id = "".join(c for c in raw_device_id if c.isalnum() or c in "_-")
+    else:
+        client_id = secrets.token_hex(4)
+
     await websocket.send_text(json.dumps({"type": "auth_ok", "id": client_id}))
     logger.info("[%s:%s] Authentication successful from %s", role, client_id, client_ip)
     return client_id
